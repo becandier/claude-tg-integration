@@ -36,15 +36,21 @@ REPLY_TO=$(python3 "$HELPER" get_reply_to "$PANE_ID" 2>/dev/null)
 # Forum Topic для этого pane
 TOPIC_ID=$(python3 "$HELPER" get_topic "$PANE_ID" 2>/dev/null)
 
-KEYBOARD="{\"inline_keyboard\":[[{\"text\":\"✅ Принять\",\"callback_data\":\"approve:${PANE_ID}\"},{\"text\":\"❌ Отклонить\",\"callback_data\":\"reject:${PANE_ID}\"}]]}"
+# Кнопки только если реально есть permission prompt в pane
+IS_PERMISSION=$(/opt/homebrew/bin/tmux capture-pane -t "$PANE_ID" -p -S -10 2>/dev/null | grep -c "Esc to cancel")
 
 CURL_ARGS=(
     -s --connect-timeout 5 --max-time 10
     -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
     -d "chat_id=${TG_CHAT_ID}"
     --data-urlencode "text=$TEXT"
-    --data-urlencode "reply_markup=$KEYBOARD"
 )
+
+if [ "$IS_PERMISSION" -gt 0 ]; then
+    KEYBOARD="{\"inline_keyboard\":[[{\"text\":\"✅ Принять\",\"callback_data\":\"approve:${PANE_ID}\"},{\"text\":\"❌ Отклонить\",\"callback_data\":\"reject:${PANE_ID}\"}]]}"
+    CURL_ARGS+=(--data-urlencode "reply_markup=$KEYBOARD")
+    TEXT="($PROJECT) 🔐 Требуется разрешение"
+fi
 
 if [ -n "$TOPIC_ID" ]; then
     CURL_ARGS+=(-d "message_thread_id=${TOPIC_ID}")
