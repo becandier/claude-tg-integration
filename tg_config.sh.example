@@ -1,0 +1,10 @@
+#!/bin/bash
+# Единый конфиг Telegram-интеграции Claude Code
+TG_BOT_TOKEN="YOUR_BOT_TOKEN"
+TG_CHAT_ID="YOUR_CHAT_ID"
+TG_USER_ID="YOUR_USER_ID"
+HELPER="$HOME/.claude/tg-integration/tg_sessions.py"
+# Открывать терминал при /newstart: "window", "tab" или "none"
+TERMINAL_MODE="tab"
+# Какой терминал: "iterm" или "terminal"
+TERMINAL_APP="iterm"

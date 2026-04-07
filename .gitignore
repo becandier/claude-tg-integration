@@ -1,0 +1,12 @@
+# Whisper models (large binaries)
+whisper-models/
+
+# Config with bot token
+tg_config.sh
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime state
+/tmp/
