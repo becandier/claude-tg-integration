@@ -15,16 +15,22 @@
 ## Как работает
 
 ```
-Telegram ──reply──→ tg_reply_watcher.py ──tmux send-keys──→ Claude Code (tmux pane)
-Telegram ←─msg────── tg_stop_hook.sh ←───── stop hook ←──── Claude Code завершил
-Telegram ←─msg────── tg_notify_hook.sh ←─── notify hook ←── Claude Code ждёт ввода
+Telegram (Forum Topic) ──→ tg_reply_watcher.py ──tmux send-keys──→ Claude Code (tmux pane)
+Telegram (Forum Topic) ←── tg_stop_hook.sh ←───── stop hook ←──── Claude Code завершил
+Telegram (Forum Topic) ←── tg_notify_hook.sh ←─── notify hook ←── Claude Code ждёт ввода
 ```
+
+Каждая сессия живёт в отдельном Forum Topic — навигация между проектами в один тап.
 
 ## Установка
 
 ### 1. Создать Telegram-бота
 
 Через [@BotFather](https://t.me/BotFather) → `/newbot` → получить токен.
+
+Настройки бота (Bot Settings):
+- **Group Privacy** → **Turn OFF** (бот должен видеть все сообщения в группе)
+- **Allow Groups** → ON
 
 ### 2. Создать супергруппу с Forum Topics
 
@@ -50,7 +56,7 @@ TERMINAL_MODE="tab"               # "tab", "window" или "none"
 TERMINAL_APP="iterm"              # "iterm" или "terminal"
 ```
 
-### 3. Зависимости
+### 4. Зависимости
 
 ```bash
 brew install tmux ffmpeg
@@ -61,7 +67,7 @@ mkdir -p whisper-models
 # Скачать модель: https://huggingface.co/ggerganov/whisper.cpp/tree/main
 ```
 
-### 4. Хуки Claude Code
+### 5. Хуки Claude Code
 
 В `~/.claude/settings.json` добавить:
 
@@ -94,7 +100,7 @@ mkdir -p whisper-models
 }
 ```
 
-### 5. Запуск
+### 6. Запуск
 
 ```bash
 python3 -u ~/.claude/tg-integration/tg_reply_watcher.py
@@ -109,15 +115,16 @@ python3 -u ~/.claude/tg-integration/tg_reply_watcher.py
 | `/newstart [проект]` | Запустить Claude Code в новой tmux-сессии |
 | `/projects` | Выбрать проект из ~/projects |
 | `/sessions` | Список активных сессий |
-| `/close` | Закрыть сессию |
+| `/close` | Закрыть сессию (в топике — закрывает сессию + топик) |
 
 ## Использование
 
 1. Отправь `/newstart my-project` или выбери проект через `/projects`
-2. Claude Code запустится в tmux — бот пришлёт подтверждение
-3. Отвечай **reply-ем** на сообщения бота — текст уходит в Claude
+2. Бот создаст **Forum Topic** и запустит Claude Code в tmux
+3. Пиши прямо в топике — текст автоматически уходит в Claude (reply не нужен)
 4. Кнопки ✅/❌ появляются когда Claude спрашивает разрешение
 5. Короткие ответы (`да`, `y`, `ok`) автоматически подтверждают permission prompts
+6. `/close` в топике — закрывает сессию и топик
 
 Голосовые сообщения распознаются и отправляются как текст.
 
