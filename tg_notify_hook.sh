@@ -34,6 +34,9 @@ PANE_ID="$TMUX_PANE"
 # reply_to — последнее сообщение пользователя из TG
 REPLY_TO=$(python3 "$HELPER" get_reply_to "$PANE_ID" 2>/dev/null)
 
+# Forum Topic для этого pane
+TOPIC_ID=$(python3 "$HELPER" get_topic "$PANE_ID" 2>/dev/null)
+
 KEYBOARD="{\"inline_keyboard\":[[{\"text\":\"✅ Принять\",\"callback_data\":\"approve:${PANE_ID}\"},{\"text\":\"❌ Отклонить\",\"callback_data\":\"reject:${PANE_ID}\"}]]}"
 
 CURL_ARGS=(
@@ -43,6 +46,10 @@ CURL_ARGS=(
     --data-urlencode "text=$TEXT"
     --data-urlencode "reply_markup=$KEYBOARD"
 )
+
+if [ -n "$TOPIC_ID" ]; then
+    CURL_ARGS+=(-d "message_thread_id=${TOPIC_ID}")
+fi
 
 if [ -n "$REPLY_TO" ]; then
     CURL_ARGS+=(-d "reply_to_message_id=${REPLY_TO}" -d "allow_sending_without_reply=true")
