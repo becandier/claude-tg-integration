@@ -64,6 +64,7 @@ def _with_lock(fn):
         data = _load()
         data.setdefault("msg_to_pane", {})
         data.setdefault("pane_to_reply", {})
+        data.setdefault("pane_to_topic", {})
         fn(data)
         _save(data)
 
@@ -90,12 +91,25 @@ def get_reply_to(pane_id):
     return data.get("pane_to_reply", {}).get(pane_id, "")
 
 
+def save_topic(pane_id, topic_id):
+    def _do(data):
+        data.setdefault("pane_to_topic", {})
+        data["pane_to_topic"][pane_id] = int(topic_id)
+    _with_lock(_do)
+
+
+def get_topic(pane_id):
+    data = _load()
+    return data.get("pane_to_topic", {}).get(pane_id, "")
+
+
 def cleanup_pane(pane_id):
     def _do(data):
         data["msg_to_pane"] = {
             k: v for k, v in data["msg_to_pane"].items() if v != pane_id
         }
         data["pane_to_reply"].pop(pane_id, None)
+        data.get("pane_to_topic", {}).pop(pane_id, None)
     _with_lock(_do)
 
 
@@ -110,12 +124,18 @@ if __name__ == "__main__":
         save_route(sys.argv[2], sys.argv[3])
     elif cmd == "save_reply_to" and len(sys.argv) == 4:
         save_reply_to(sys.argv[2], sys.argv[3])
+    elif cmd == "save_topic" and len(sys.argv) == 4:
+        save_topic(sys.argv[2], sys.argv[3])
     elif cmd == "get_pane" and len(sys.argv) == 3:
         result = get_pane(sys.argv[2])
         if result:
             print(result)
     elif cmd == "get_reply_to" and len(sys.argv) == 3:
         result = get_reply_to(sys.argv[2])
+        if result:
+            print(result)
+    elif cmd == "get_topic" and len(sys.argv) == 3:
+        result = get_topic(sys.argv[2])
         if result:
             print(result)
     elif cmd == "cleanup_pane" and len(sys.argv) == 3:
