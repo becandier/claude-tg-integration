@@ -12,6 +12,7 @@ Telegram Reply Watcher for Claude Code (multi-session)
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -838,8 +839,9 @@ def main():
             if msg.get("from", {}).get("id") != USER_ID:
                 continue
 
-            # Команды бота (прямые сообщения)
-            cmd_text = msg.get("text", "").strip()
+            # Команды бота — убираем @bot_username суффикс (в группах: /cmd@botname args)
+            raw_text = msg.get("text", "").strip()
+            cmd_text = re.sub(r"^(/\w+)@\w+", r"\1", raw_text)
             if cmd_text.startswith("/newstart"):
                 try:
                     handle_newstart(msg, cmd_text)
