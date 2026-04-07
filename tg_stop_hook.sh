@@ -134,7 +134,9 @@ print(result)
 ' 2>/dev/null)
 
 if [ -z "$SUMMARY" ]; then
-    touch /tmp/claude_code_stopped
+    _PANE_ID="${TMUX_PANE}"
+    _STOP_FLAG="/tmp/claude_code_stopped_${_PANE_ID//[^a-zA-Z0-9]/_}"
+    touch "$_STOP_FLAG"
     exit 0
 fi
 
@@ -146,7 +148,10 @@ else
 fi
 MSG=$(printf '(<b>%s</b>) %s\n\n%s' "$ESC_PROJECT" "$ICON" "$SUMMARY")
 
-touch /tmp/claude_code_stopped
+# Per-pane stop flag (notify hook проверяет его)
+_PANE_ID="${TMUX_PANE}"
+_STOP_FLAG="/tmp/claude_code_stopped_${_PANE_ID//[^a-zA-Z0-9]/_}"
+touch "$_STOP_FLAG"
 
 # reply_to если в tmux
 REPLY_TO=""

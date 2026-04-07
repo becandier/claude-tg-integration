@@ -8,15 +8,16 @@
 source "$HOME/.claude/tg-integration/tg_config.sh"
 PROJECT=$(basename "$PWD")
 
-# stop-hook ставит этот флаг при успешной отправке
-STOP_FLAG="/tmp/claude_code_stopped"
+# stop-hook ставит этот флаг при успешной отправке (per-pane для multi-session)
+PANE_ID="$TMUX_PANE"
+STOP_FLAG="/tmp/claude_code_stopped_${PANE_ID//[^a-zA-Z0-9]/_}"
 
 # Текст зависит от того, дошёл ли ответ
 if [ -f "$STOP_FLAG" ]; then
     rm -f "$STOP_FLAG"
-    TEXT="($PROJECT) ✅ Ответь reply-ем чтобы продолжить"
+    TEXT="($PROJECT) ✅ Ждёт ввода"
 else
-    TEXT="($PROJECT) ⏳ Claude Code ждёт ввода — ответь reply-ем"
+    TEXT="($PROJECT) ⏳ Claude Code ждёт ввода"
 fi
 
 # Если не в tmux — тихое уведомление без маршрутизации
@@ -28,8 +29,6 @@ if [ -z "$TMUX" ]; then
         --data-urlencode "text=$TEXT" > /dev/null
     exit 0
 fi
-
-PANE_ID="$TMUX_PANE"
 
 # reply_to — последнее сообщение пользователя из TG
 REPLY_TO=$(python3 "$HELPER" get_reply_to "$PANE_ID" 2>/dev/null)

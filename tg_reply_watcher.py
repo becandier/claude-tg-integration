@@ -578,12 +578,18 @@ def handle_sessions(msg):
 
 
 def close_session(session_name):
-    """Gracefully close a Claude Code tmux session."""
+    """Gracefully close a Claude Code tmux session + закрыть Forum Topic."""
     result = subprocess.run(
         ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_id}"],
         capture_output=True, text=True,
     )
     pane_id = result.stdout.strip().split("\n")[0] if result.stdout.strip() else None
+
+    # Закрываем Forum Topic до cleanup (после cleanup маппинг пропадёт)
+    if pane_id:
+        topic_id = tg_sessions.get_topic(pane_id)
+        if topic_id:
+            close_topic(topic_id)
 
     try:
         subprocess.run(["tmux", "send-keys", "-t", session_name, "C-c"], timeout=2)
@@ -648,8 +654,7 @@ def handle_close(msg):
         if pane_id:
             tg_send("🔴 Закрываю сессию...", topic_id=topic_id)
             close_session_by_pane(pane_id)
-            tg_send("🔴 Сессия закрыта", topic_id=topic_id)
-            close_topic(topic_id)
+            # close_session уже закроет топик
         else:
             tg_send("⚠️ Нет активной сессии в этом топике", topic_id=topic_id)
             close_topic(topic_id)
@@ -789,14 +794,17 @@ def main():
     signal.signal(signal.SIGINT, cleanup_pid)
     init_offset()
 
-    # Регистрируем команды бота (кнопка Menu в чате)
+    # Регистрируем команды бота (для меню в группе и в приватном чате)
+    commands = json.dumps([
+        {"command": "newstart", "description": "🚀 Новая сессия Claude Code"},
+        {"command": "projects", "description": "📁 Список проектов"},
+        {"command": "sessions", "description": "📋 Активные сессии"},
+        {"command": "close", "description": "🔴 Закрыть сессию"},
+    ])
+    tg_api("setMyCommands", {"commands": commands})
     tg_api("setMyCommands", {
-        "commands": json.dumps([
-            {"command": "newstart", "description": "🚀 Новая сессия Claude Code"},
-            {"command": "projects", "description": "📁 Список проектов"},
-            {"command": "sessions", "description": "📋 Активные сессии"},
-            {"command": "close", "description": "🔴 Закрыть сессию"},
-        ])
+        "commands": commands,
+        "scope": json.dumps({"type": "all_group_chats"}),
     })
     logger.info("Telegram Reply Watcher started")
     backoff = 5
