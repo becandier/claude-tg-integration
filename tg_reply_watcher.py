@@ -610,10 +610,49 @@ def close_session(session_name):
     logger.info(f"[Close] session {session_name} closed")
 
 
+def close_topic(topic_id):
+    """Закрывает Forum Topic."""
+    resp = tg_api("closeForumTopic", {
+        "chat_id": CHAT_ID,
+        "message_thread_id": topic_id,
+    })
+    if resp.get("ok"):
+        logger.info(f"[Topic] Closed topic {topic_id}")
+    else:
+        logger.error(f"[Topic] Failed to close {topic_id}: {resp}")
+
+
+def close_session_by_pane(pane_id):
+    """Закрывает tmux-сессию по pane_id."""
+    # Находим имя сессии по pane
+    result = subprocess.run(
+        ["tmux", "display-message", "-t", pane_id, "-p", "#{session_name}"],
+        capture_output=True, text=True,
+    )
+    session_name = result.stdout.strip()
+    if session_name:
+        close_session(session_name)
+    else:
+        tg_sessions.cleanup_pane(pane_id)
+
+
 def handle_close(msg):
-    """Показывает активные сессии с кнопками закрытия."""
+    """Закрывает сессию. В топике — закрывает эту сессию + топик. В General — список."""
     user_msg_id = msg.get("message_id")
     topic_id = get_msg_topic(msg)
+
+    # Если /close из топика — закрыть сессию этого топика
+    if topic_id:
+        pane_id = tg_sessions.get_pane_by_topic(topic_id)
+        if pane_id:
+            tg_send("🔴 Закрываю сессию...", topic_id=topic_id)
+            close_session_by_pane(pane_id)
+            tg_send("🔴 Сессия закрыта", topic_id=topic_id)
+            close_topic(topic_id)
+        else:
+            tg_send("⚠️ Нет активной сессии в этом топике", topic_id=topic_id)
+            close_topic(topic_id)
+        return
     result = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{session_name} #{session_path}"],
         capture_output=True, text=True,
