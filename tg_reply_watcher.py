@@ -80,6 +80,57 @@ def tg_api(method, params=None):
         return {"ok": False}
 
 
+# Палитра цветов для Forum Topics (ротация)
+TOPIC_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
+_topic_color_idx = 0
+
+
+def create_forum_topic(name):
+    """Создаёт Forum Topic в супергруппе, возвращает message_thread_id или None."""
+    global _topic_color_idx
+    color = TOPIC_COLORS[_topic_color_idx % len(TOPIC_COLORS)]
+    _topic_color_idx += 1
+    resp = tg_api("createForumTopic", {
+        "chat_id": CHAT_ID,
+        "name": name[:128],
+        "icon_color": color,
+    })
+    if resp.get("ok"):
+        return resp["result"]["message_thread_id"]
+    logger.error(f"[Topic] Failed to create: {resp}")
+    return None
+
+
+def tg_send(text, topic_id=None, reply_to=None, parse_mode=None, reply_markup=None):
+    """Отправка сообщения с поддержкой Forum Topics."""
+    params = {"chat_id": CHAT_ID, "text": text}
+    if topic_id:
+        params["message_thread_id"] = topic_id
+    if reply_to:
+        params["reply_to_message_id"] = reply_to
+        params["allow_sending_without_reply"] = "true"
+    if parse_mode:
+        params["parse_mode"] = parse_mode
+    if reply_markup:
+        params["reply_markup"] = reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
+    return tg_api("sendMessage", params)
+
+
+def tg_edit(message_id, text, parse_mode=None, reply_markup=None):
+    """Редактирование сообщения."""
+    params = {"chat_id": CHAT_ID, "message_id": message_id, "text": text}
+    if parse_mode:
+        params["parse_mode"] = parse_mode
+    if reply_markup:
+        params["reply_markup"] = reply_markup if isinstance(reply_markup, str) else json.dumps(reply_markup)
+    return tg_api("editMessageText", params)
+
+
+def get_msg_topic(msg):
+    """Извлекает message_thread_id из входящего сообщения (если из топика)."""
+    return msg.get("message_thread_id")
+
+
 def tg_react(message_id, emoji="\u26a1"):
     """Ставит реакцию на сообщение как подтверждение доставки."""
     params = {
@@ -296,6 +347,7 @@ def handle_newstart(msg, text):
     parts = text.split(maxsplit=1)
     project = parts[1].strip() if len(parts) > 1 else None
     user_msg_id = msg.get("message_id")
+    src_topic = get_msg_topic(msg)
 
     if not project:
         handle_projects(msg)
@@ -308,17 +360,19 @@ def handle_newstart(msg, text):
     else:
         project_dir = os.path.join(PROJECTS_ROOT, project)
     if not os.path.isdir(project_dir):
-        tg_api("sendMessage", {
-            "chat_id": CHAT_ID,
-            "text": f"❌ Проект не найден: {project}",
-            "reply_to_message_id": user_msg_id,
-        })
+        tg_send(f"❌ Проект не найден: {project}", topic_id=src_topic, reply_to=user_msg_id)
         return
 
     session_name = f"claude-{int(time.time())}"
     project_name = os.path.basename(project_dir)
 
     tg_react(user_msg_id, "⚡")
+
+    # Создаём Forum Topic для этой сессии
+    topic_id = create_forum_topic(f"🚀 {project_name}")
+    if not topic_id:
+        tg_send("❌ Не удалось создать топик", topic_id=src_topic, reply_to=user_msg_id)
+        return
 
     shell_cmd = (
         f"claude --dangerously-skip-permissions; "
@@ -331,11 +385,10 @@ def handle_newstart(msg, text):
     )
 
     if result.returncode != 0:
-        tg_api("sendMessage", {
-            "chat_id": CHAT_ID,
-            "text": f"❌ Не удалось создать сессию:\n{result.stderr[:200]}",
-            "reply_to_message_id": user_msg_id,
-        })
+        tg_send(
+            f"❌ Не удалось создать сессию:\n{result.stderr[:200]}",
+            topic_id=topic_id, reply_to=user_msg_id,
+        )
         return
 
     result = subprocess.run(
@@ -345,18 +398,16 @@ def handle_newstart(msg, text):
     pane_id = result.stdout.strip().split("\n")[0] if result.stdout.strip() else None
 
     if not pane_id:
-        tg_api("sendMessage", {
-            "chat_id": CHAT_ID,
-            "text": "❌ Сессия создана, но не удалось получить pane_id",
-            "reply_to_message_id": user_msg_id,
-        })
+        tg_send("❌ Сессия создана, но не удалось получить pane_id", topic_id=topic_id)
         return
 
-    response = tg_api("sendMessage", {
-        "chat_id": CHAT_ID,
-        "text": f"🚀 Claude Code запущен\nПроект: {project_name}\nСессия: {session_name}",
-        "reply_to_message_id": user_msg_id,
-    })
+    # Сохраняем маппинг pane → topic
+    tg_sessions.save_topic(pane_id, topic_id)
+
+    response = tg_send(
+        f"🚀 Claude Code запущен\nПроект: {project_name}\nСессия: {session_name}",
+        topic_id=topic_id,
+    )
 
     if response.get("ok"):
         bot_msg_id = str(response["result"]["message_id"])
@@ -364,7 +415,7 @@ def handle_newstart(msg, text):
 
     tg_sessions.save_reply_to(pane_id, user_msg_id)
     open_terminal_with_tmux(session_name)
-    logger.info(f"[NewStart] session={session_name} pane={pane_id} project={project_name}")
+    logger.info(f"[NewStart] session={session_name} pane={pane_id} topic={topic_id} project={project_name}")
 
 
 def _is_project(path):
@@ -475,45 +526,35 @@ def _project_keyboard():
 def handle_projects(msg):
     """Список проектов с инлайн-кнопками."""
     user_msg_id = msg.get("message_id")
+    topic_id = get_msg_topic(msg)
 
     if not os.path.isdir(PROJECTS_ROOT):
-        tg_api("sendMessage", {
-            "chat_id": CHAT_ID,
-            "text": "📁 ~/projects не найдена",
-            "reply_to_message_id": user_msg_id,
-        })
+        tg_send("📁 ~/projects не найдена", topic_id=topic_id, reply_to=user_msg_id)
         return
 
     keyboard = _project_keyboard()
     if not keyboard:
-        tg_api("sendMessage", {
-            "chat_id": CHAT_ID,
-            "text": "📁 Нет проектов в ~/projects",
-            "reply_to_message_id": user_msg_id,
-        })
+        tg_send("📁 Нет проектов в ~/projects", topic_id=topic_id, reply_to=user_msg_id)
         return
 
-    tg_api("sendMessage", {
-        "chat_id": CHAT_ID,
-        "text": "📁 Выбери проект:",
-        "reply_to_message_id": user_msg_id,
-        "reply_markup": json.dumps({"inline_keyboard": keyboard}),
-    })
+    tg_send(
+        "📁 Выбери проект:",
+        topic_id=topic_id,
+        reply_to=user_msg_id,
+        reply_markup={"inline_keyboard": keyboard},
+    )
 
 
 def handle_sessions(msg):
     """Показывает активные tmux-сессии с Claude Code."""
     user_msg_id = msg.get("message_id")
+    topic_id = get_msg_topic(msg)
     result = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{session_name} #{session_path}"],
         capture_output=True, text=True,
     )
     if result.returncode != 0 or not result.stdout.strip():
-        tg_api("sendMessage", {
-            "chat_id": CHAT_ID,
-            "text": "📋 Нет активных сессий",
-            "reply_to_message_id": user_msg_id,
-        })
+        tg_send("📋 Нет активных сессий", topic_id=topic_id, reply_to=user_msg_id)
         return
 
     lines = ["📋 <b>Активные сессии:</b>\n"]
@@ -527,12 +568,12 @@ def handle_sessions(msg):
     if len(lines) == 1:
         lines.append("Нет сессий Claude Code")
 
-    tg_api("sendMessage", {
-        "chat_id": CHAT_ID,
-        "text": "\n".join(lines),
-        "parse_mode": "HTML",
-        "reply_to_message_id": user_msg_id,
-    })
+    tg_send(
+        "\n".join(lines),
+        topic_id=topic_id,
+        reply_to=user_msg_id,
+        parse_mode="HTML",
+    )
 
 
 def close_session(session_name):
@@ -572,16 +613,13 @@ def close_session(session_name):
 def handle_close(msg):
     """Показывает активные сессии с кнопками закрытия."""
     user_msg_id = msg.get("message_id")
+    topic_id = get_msg_topic(msg)
     result = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{session_name} #{session_path}"],
         capture_output=True, text=True,
     )
     if result.returncode != 0 or not result.stdout.strip():
-        tg_api("sendMessage", {
-            "chat_id": CHAT_ID,
-            "text": "📋 Нет активных сессий",
-            "reply_to_message_id": user_msg_id,
-        })
+        tg_send("📋 Нет активных сессий", topic_id=topic_id, reply_to=user_msg_id)
         return
 
     keyboard = []
@@ -596,11 +634,7 @@ def handle_close(msg):
             }])
 
     if not keyboard:
-        tg_api("sendMessage", {
-            "chat_id": CHAT_ID,
-            "text": "📋 Нет активных сессий Claude Code",
-            "reply_to_message_id": user_msg_id,
-        })
+        tg_send("📋 Нет активных сессий Claude Code", topic_id=topic_id, reply_to=user_msg_id)
         return
 
     if len(keyboard) > 1:
@@ -609,12 +643,12 @@ def handle_close(msg):
             "callback_data": "close:__all__",
         }])
 
-    tg_api("sendMessage", {
-        "chat_id": CHAT_ID,
-        "text": "🔴 Выбери сессию для закрытия:",
-        "reply_to_message_id": user_msg_id,
-        "reply_markup": json.dumps({"inline_keyboard": keyboard}),
-    })
+    tg_send(
+        "🔴 Выбери сессию для закрытия:",
+        topic_id=topic_id,
+        reply_to=user_msg_id,
+        reply_markup={"inline_keyboard": keyboard},
+    )
 
 
 def handle_callback(callback_query):
@@ -635,11 +669,7 @@ def handle_callback(callback_query):
                 "text": "⚠️ Сессия не найдена",
                 "show_alert": True,
             })
-            tg_api("editMessageText", {
-                "chat_id": CHAT_ID,
-                "message_id": chat_msg_id,
-                "text": f"{original_text}\n\n⚠️ Сессия не найдена",
-            })
+            tg_edit(chat_msg_id, f"{original_text}\n\n⚠️ Сессия не найдена")
             return
 
         if not is_permission_prompt(pane_id):
@@ -661,11 +691,7 @@ def handle_callback(callback_query):
             "callback_query_id": cb_id,
             "text": label,
         })
-        tg_api("editMessageText", {
-            "chat_id": CHAT_ID,
-            "message_id": chat_msg_id,
-            "text": f"{original_text}\n\n{label}",
-        })
+        tg_edit(chat_msg_id, f"{original_text}\n\n{label}")
         logger.info(f"[Callback] {label} -> pane {pane_id}")
     elif data.startswith("start:"):
         project = data[6:]
@@ -682,12 +708,11 @@ def handle_callback(callback_query):
 
         keyboard = _folder_keyboard(rel_path)
         folder_name = os.path.basename(rel_path) if rel_path else "проекты"
-        tg_api("editMessageText", {
-            "chat_id": CHAT_ID,
-            "message_id": chat_msg_id,
-            "text": f"📁 {folder_name}:",
-            "reply_markup": json.dumps({"inline_keyboard": keyboard}),
-        })
+        tg_edit(
+            chat_msg_id,
+            f"📁 {folder_name}:",
+            reply_markup={"inline_keyboard": keyboard},
+        )
     elif data.startswith("close:"):
         session = data[6:]
         tg_api("answerCallbackQuery", {
@@ -712,11 +737,7 @@ def handle_callback(callback_query):
             close_session(session)
             text = f"🔴 Сессия {session} закрыта"
 
-        tg_api("editMessageText", {
-            "chat_id": CHAT_ID,
-            "message_id": chat_msg_id,
-            "text": text,
-        })
+        tg_edit(chat_msg_id, text)
     else:
         tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
 
