@@ -150,9 +150,11 @@ touch /tmp/claude_code_stopped
 
 # reply_to если в tmux
 REPLY_TO=""
+TOPIC_ID=""
 PANE_ID="${TMUX_PANE}"
 if [ -n "$TMUX" ] && [ -n "$PANE_ID" ]; then
     REPLY_TO=$(python3 "$HELPER" get_reply_to "$PANE_ID" 2>/dev/null)
+    TOPIC_ID=$(python3 "$HELPER" get_topic "$PANE_ID" 2>/dev/null)
 fi
 
 CURL_ARGS=(
@@ -166,6 +168,10 @@ CURL_ARGS=(
 # Без tmux — тихое уведомление
 if [ -z "$TMUX" ]; then
     CURL_ARGS+=(-d "disable_notification=true")
+fi
+
+if [ -n "$TOPIC_ID" ]; then
+    CURL_ARGS+=(-d "message_thread_id=${TOPIC_ID}")
 fi
 
 if [ -n "$REPLY_TO" ]; then
