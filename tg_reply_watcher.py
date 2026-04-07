@@ -826,12 +826,6 @@ def main():
                     logger.error(f"[Close] {e}")
                 continue
 
-            reply_to = msg.get("reply_to_message")
-            if not reply_to:
-                continue
-            if not reply_to.get("from", {}).get("is_bot", False):
-                continue
-
             # Текст или голосовое сообщение
             text = msg.get("text", "").strip()
             voice = msg.get("voice")
@@ -848,16 +842,24 @@ def main():
             if not text:
                 continue
 
-            # Склеиваем многострочное в одну строку
-            text = " ".join(text.split())
             user_msg_id = msg.get("message_id")
 
-            # Ищем маршрут по message_id сообщения бота
-            reply_msg_id = str(reply_to.get("message_id", ""))
-            pane_id = tg_sessions.get_pane(reply_msg_id)
+            # Маршрутизация: топик → pane (приоритет), fallback на reply
+            topic_id = get_msg_topic(msg)
+            pane_id = None
+
+            if topic_id:
+                pane_id = tg_sessions.get_pane_by_topic(topic_id)
 
             if not pane_id:
-                logger.info(f"No route for msg_id={reply_msg_id}")
+                reply_to = msg.get("reply_to_message")
+                if reply_to and reply_to.get("from", {}).get("is_bot", False):
+                    reply_msg_id = str(reply_to.get("message_id", ""))
+                    pane_id = tg_sessions.get_pane(reply_msg_id)
+
+            if not pane_id:
+                if topic_id:
+                    logger.info(f"No pane for topic={topic_id}")
                 continue
 
             # Quick replies для permission-промптов (Do you want to make this edit?)

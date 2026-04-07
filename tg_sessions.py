@@ -103,6 +103,16 @@ def get_topic(pane_id):
     return data.get("pane_to_topic", {}).get(pane_id, "")
 
 
+def get_pane_by_topic(topic_id):
+    """Обратный поиск: topic_id → pane_id (для прямых сообщений в топике без reply)."""
+    data = _load()
+    topic_id = int(topic_id)
+    for pane, tid in data.get("pane_to_topic", {}).items():
+        if tid == topic_id:
+            return pane
+    return ""
+
+
 def cleanup_pane(pane_id):
     def _do(data):
         data["msg_to_pane"] = {
