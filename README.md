@@ -4,6 +4,7 @@
 
 ## Возможности
 
+- **Forum Topics** — каждая сессия в отдельном топике, удобная навигация между проектами
 - **Мульти-сессии** — несколько Claude Code сессий параллельно, каждая в своём tmux pane
 - **Голосовой ввод** — голосовые сообщения распознаются офлайн через Whisper
 - **Permission prompts** — инлайн-кнопки ✅/❌ для подтверждения действий Claude
@@ -25,7 +26,15 @@ Telegram ←─msg────── tg_notify_hook.sh ←─── notify hook 
 
 Через [@BotFather](https://t.me/BotFather) → `/newbot` → получить токен.
 
-### 2. Конфигурация
+### 2. Создать супергруппу с Forum Topics
+
+1. Создать группу в Telegram (любое название, например "Claude Code")
+2. Настройки группы → Topics → включить
+3. Добавить бота в группу
+4. Сделать бота администратором с правом **Manage Topics**
+5. Узнать ID группы (переслать сообщение из группы в `@userinfobot`)
+
+### 3. Конфигурация
 
 ```bash
 cp tg_config.sh.example tg_config.sh
@@ -35,8 +44,8 @@ cp tg_config.sh.example tg_config.sh
 
 ```bash
 TG_BOT_TOKEN="your_bot_token"
-TG_CHAT_ID="your_chat_id"        # узнать: @userinfobot
-TG_USER_ID="your_user_id"
+TG_CHAT_ID="-1001234567890"       # ID супергруппы (отрицательное число)
+TG_USER_ID="your_user_id"         # узнать: @userinfobot
 TERMINAL_MODE="tab"               # "tab", "window" или "none"
 TERMINAL_APP="iterm"              # "iterm" или "terminal"
 ```
