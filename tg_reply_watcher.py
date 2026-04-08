@@ -304,6 +304,10 @@ def tmux_send(pane_id, text):
     if not pane_exists(pane_id):
         return False
     subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text])
+    # Длинный текст вызывает bracketed paste в Claude Code ([Pasted-text]).
+    # Нужна пауза, чтобы Claude Code успел обработать paste перед Enter.
+    if len(text) > 120:
+        time.sleep(0.5)
     subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"])
     return True
 
@@ -326,6 +330,26 @@ def is_permission_prompt(pane_id):
     if result.returncode != 0:
         return False
     return "Esc to cancel" in result.stdout
+
+
+def wait_and_trust_folder(pane_id, timeout=15):
+    """Ждёт появления trust-промпта Claude Code и автоматически подтверждает."""
+    for _ in range(timeout * 5):
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-25"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return False
+        content = result.stdout
+        if "Yes, I trust this folder" in content or "Enter to confirm" in content:
+            time.sleep(0.3)
+            subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+            logger.info(f"[Trust] Auto-confirmed trust prompt for pane {pane_id}")
+            return True
+        time.sleep(0.2)
+    logger.warning(f"[Trust] Timeout waiting for trust prompt on pane {pane_id}")
+    return False
 
 
 def write_pid():
@@ -404,6 +428,9 @@ def handle_newstart(msg, text):
 
     # Сохраняем маппинг pane → topic
     tg_sessions.save_topic(pane_id, topic_id)
+
+    # Автоматически подтверждаем trust-промпт ("Yes, I trust this folder")
+    wait_and_trust_folder(pane_id)
 
     response = tg_send(
         f"🚀 Claude Code запущен\nПроект: {project_name}\nСессия: {session_name}",
