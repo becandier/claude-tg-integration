@@ -16,7 +16,9 @@ import re
 import signal
 import subprocess
 import sys
+import shutil
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -51,6 +53,7 @@ PROJECT_MARKERS = {
     ".git", "pubspec.yaml", "package.json", "Cargo.toml",
     "go.mod", "pyproject.toml", "Makefile", "CMakeLists.txt", "pom.xml",
 }
+MEDIA_DIR = "/tmp/claude_tg_media"
 
 # Импортируем shared-модуль
 sys.path.insert(0, os.path.expanduser("~/.claude/tg-integration"))
@@ -72,18 +75,26 @@ def setup_logging():
 def tg_api(method, params=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = urllib.parse.urlencode(params).encode() if params else None
-    try:
-        req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        logger.error(f"[TG API] {method}: {e}")
-        return {"ok": False}
+    # getUpdates — long polling, ретраи не нужны (main loop сам обработает).
+    # Остальные методы ретраим до 3 раз при сетевых ошибках.
+    max_attempts = 1 if method == "getUpdates" else 3
+    for attempt in range(max_attempts):
+        try:
+            req = urllib.request.Request(url, data=data)
+            timeout = 35 if method == "getUpdates" else 10
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            logger.error(f"[TG API] {method} (attempt {attempt + 1}/{max_attempts}): {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(1)
+    return {"ok": False}
 
 
 # Палитра цветов для Forum Topics (ротация)
 TOPIC_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
-_topic_color_idx = 0
+# Инициализируем индекс из количества существующих топиков, чтобы не повторять цвета после рестарта
+_topic_color_idx = len(tg_sessions._load().get("pane_to_topic", {}))
 
 
 def create_forum_topic(name):
@@ -155,6 +166,39 @@ def tg_download_file(file_id, dest_path):
     except Exception as e:
         logger.error(f"[Download] {e}")
         return False
+
+
+def _safe_pane_id(pane_id):
+    """Безопасное имя директории из pane_id (убирает спецсимволы)."""
+    return pane_id.replace("%", "pane").replace("/", "_")
+
+
+def media_dir_for_pane(pane_id):
+    return os.path.join(MEDIA_DIR, _safe_pane_id(pane_id))
+
+
+def download_media(file_id, pane_id, filename):
+    """Скачивает медиафайл в директорию pane, возвращает путь или None."""
+    dest_dir = media_dir_for_pane(pane_id)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, filename)
+    if tg_download_file(file_id, dest_path):
+        logger.info(f"[Media] Downloaded {dest_path}")
+        return dest_path
+    return None
+
+
+def cleanup_media(pane_id=None):
+    """Удаляет медиафайлы. Если pane_id — только для этого pane, иначе все."""
+    if pane_id:
+        path = media_dir_for_pane(pane_id)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            logger.info(f"[Media] Cleaned {path}")
+    else:
+        if os.path.isdir(MEDIA_DIR):
+            shutil.rmtree(MEDIA_DIR, ignore_errors=True)
+            logger.info("[Media] Cleaned all media")
 
 
 def transcribe_voice(file_id):
@@ -329,7 +373,12 @@ def is_permission_prompt(pane_id):
     )
     if result.returncode != 0:
         return False
-    return "Esc to cancel" in result.stdout
+    lines = result.stdout
+    # Проверяем комбинацию признаков реального промпта Claude Code,
+    # а не случайное упоминание "Esc to cancel" в тексте
+    has_esc = "Esc to cancel" in lines
+    has_enter = "Enter to confirm" in lines or "Enter to proceed" in lines
+    return has_esc and has_enter
 
 
 def wait_and_trust_folder(pane_id, timeout=15):
@@ -429,8 +478,10 @@ def handle_newstart(msg, text):
     # Сохраняем маппинг pane → topic
     tg_sessions.save_topic(pane_id, topic_id)
 
-    # Автоматически подтверждаем trust-промпт ("Yes, I trust this folder")
-    wait_and_trust_folder(pane_id)
+    # Автоматически подтверждаем trust-промпт в фоне (не блокируя polling)
+    threading.Thread(
+        target=wait_and_trust_folder, args=(pane_id,), daemon=True
+    ).start()
 
     response = tg_send(
         f"🚀 Claude Code запущен\nПроект: {project_name}\nСессия: {session_name}",
@@ -640,6 +691,7 @@ def close_session(session_name):
     )
 
     if pane_id:
+        cleanup_media(pane_id)
         tg_sessions.cleanup_pane(pane_id)
     logger.info(f"[Close] session {session_name} closed")
 
@@ -723,6 +775,35 @@ def handle_close(msg):
     )
 
 
+def handle_cleanup(msg):
+    """Очищает все скачанные медиафайлы."""
+    user_msg_id = msg.get("message_id")
+    topic_id = get_msg_topic(msg)
+    cleanup_media()
+    tg_send("🧹 Все медиафайлы удалены", topic_id=topic_id, reply_to=user_msg_id)
+
+
+_last_pane_check = 0.0
+
+
+def check_dead_panes():
+    """Проверяет живость pane'ов, уведомляет о мёртвых и чистит ресурсы."""
+    global _last_pane_check
+    now = time.time()
+    if now - _last_pane_check < 30:
+        return
+    _last_pane_check = now
+
+    data = tg_sessions._load()
+    pane_to_topic = data.get("pane_to_topic", {})
+    for pane_id, topic_id in list(pane_to_topic.items()):
+        if not pane_exists(pane_id):
+            tg_send("⚠️ Сессия завершилась", topic_id=topic_id)
+            cleanup_media(pane_id)
+            tg_sessions.cleanup_pane(pane_id)
+            logger.info(f"[DeadPane] pane {pane_id} dead, notified topic {topic_id}")
+
+
 def handle_callback(callback_query):
     """Обработка нажатий инлайн-кнопок."""
     cb_id = callback_query.get("id")
@@ -767,6 +848,14 @@ def handle_callback(callback_query):
         logger.info(f"[Callback] {label} -> pane {pane_id}")
     elif data.startswith("start:"):
         project = data[6:]
+        # Защита от path traversal
+        if ".." in project and project not in ("__home__", "__projects__"):
+            tg_api("answerCallbackQuery", {
+                "callback_query_id": cb_id,
+                "text": "⚠️ Недопустимый путь",
+                "show_alert": True,
+            })
+            return
         label = "домашняя директория" if project == "__home__" else project
         tg_api("answerCallbackQuery", {
             "callback_query_id": cb_id,
@@ -775,6 +864,13 @@ def handle_callback(callback_query):
         handle_newstart(msg, f"/newstart {project}")
     elif data.startswith("nav:"):
         rel_path = data[4:]  # может быть "" для корня
+        if ".." in rel_path:
+            tg_api("answerCallbackQuery", {
+                "callback_query_id": cb_id,
+                "text": "⚠️ Недопустимый путь",
+                "show_alert": True,
+            })
+            return
         tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
         chat_msg_id = msg.get("message_id")
 
@@ -827,6 +923,7 @@ def main():
         {"command": "projects", "description": "📁 Список проектов"},
         {"command": "sessions", "description": "📋 Активные сессии"},
         {"command": "close", "description": "🔴 Закрыть сессию"},
+        {"command": "cleanup", "description": "🧹 Очистить все медиафайлы"},
     ])
     tg_api("setMyCommands", {"commands": commands})
     tg_api("setMyCommands", {
@@ -901,10 +998,18 @@ def main():
                 except Exception as e:
                     logger.error(f"[Close] {e}")
                 continue
+            if cmd_text == "/cleanup":
+                try:
+                    handle_cleanup(msg)
+                except Exception as e:
+                    logger.error(f"[Cleanup] {e}")
+                continue
 
-            # Текст или голосовое сообщение
+            # Текст, голосовое, фото или документ
             text = msg.get("text", "").strip()
             voice = msg.get("voice")
+            photo = msg.get("photo")
+            document = msg.get("document")
 
             if not text and voice:
                 file_id = voice.get("file_id")
@@ -915,7 +1020,12 @@ def main():
                         logger.info("Voice transcription failed, skipping")
                         continue
 
-            if not text:
+            # Caption от фото/документа
+            if not text and (photo or document):
+                text = msg.get("caption", "").strip()
+
+            has_media = bool(photo or document)
+            if not text and not has_media:
                 continue
 
             user_msg_id = msg.get("message_id")
@@ -938,6 +1048,23 @@ def main():
                     logger.info(f"No pane for topic={topic_id}")
                 continue
 
+            # Скачиваем медиафайл если есть
+            media_path = None
+            if photo:
+                file_id = photo[-1]["file_id"]  # самый большой размер
+                media_path = download_media(file_id, pane_id, f"photo_{user_msg_id}.jpg")
+            elif document:
+                file_name = document.get("file_name", f"doc_{user_msg_id}")
+                file_id = document["file_id"]
+                media_path = download_media(file_id, pane_id, file_name)
+
+            if media_path:
+                label = "Фото" if photo else os.path.basename(media_path)
+                text = f"[Файл ({label}): {media_path}] {text}" if text else f"[Файл ({label}): {media_path}]"
+
+            if not text:
+                continue
+
             # Quick replies для permission-промптов (Do you want to make this edit?)
             lower = text.lower()
             if lower in ("y", "yes", "да", "1", "ок", "ok", "+") and is_permission_prompt(pane_id):
@@ -956,11 +1083,18 @@ def main():
                 tg_react(user_msg_id)
                 logger.info("  OK")
             else:
+                cleanup_media(pane_id)
                 tg_sessions.cleanup_pane(pane_id)
                 logger.info(f"  Pane {pane_id} not found, cleaned up")
 
         if new_offset > offset:
             save_offset(new_offset)
+
+        # Периодическая проверка мёртвых pane'ов
+        try:
+            check_dead_panes()
+        except Exception as e:
+            logger.error(f"[DeadPane] {e}")
 
 
 if __name__ == "__main__":

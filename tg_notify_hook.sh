@@ -36,8 +36,19 @@ REPLY_TO=$(python3 "$HELPER" get_reply_to "$PANE_ID" 2>/dev/null)
 # Forum Topic для этого pane
 TOPIC_ID=$(python3 "$HELPER" get_topic "$PANE_ID" 2>/dev/null)
 
-# Кнопки только если реально есть permission prompt в pane
-IS_PERMISSION=$(/opt/homebrew/bin/tmux capture-pane -t "$PANE_ID" -p -S -10 2>/dev/null | grep -c "Esc to cancel")
+# Кнопки только если реально есть permission prompt в pane (оба маркера)
+PANE_CONTENT=$(/opt/homebrew/bin/tmux capture-pane -t "$PANE_ID" -p -S -10 2>/dev/null)
+HAS_ESC=$(printf '%s' "$PANE_CONTENT" | grep -c "Esc to cancel")
+HAS_ENTER=$(printf '%s' "$PANE_CONTENT" | grep -cE "Enter to (confirm|proceed)")
+IS_PERMISSION=0
+if [ "$HAS_ESC" -gt 0 ] && [ "$HAS_ENTER" -gt 0 ]; then
+    IS_PERMISSION=1
+fi
+
+if [ "$IS_PERMISSION" -gt 0 ]; then
+    KEYBOARD="{\"inline_keyboard\":[[{\"text\":\"✅ Принять\",\"callback_data\":\"approve:${PANE_ID}\"},{\"text\":\"❌ Отклонить\",\"callback_data\":\"reject:${PANE_ID}\"}]]}"
+    TEXT="($PROJECT) 🔐 Требуется разрешение"
+fi
 
 CURL_ARGS=(
     -s --connect-timeout 5 --max-time 10
@@ -46,10 +57,8 @@ CURL_ARGS=(
     --data-urlencode "text=$TEXT"
 )
 
-if [ "$IS_PERMISSION" -gt 0 ]; then
-    KEYBOARD="{\"inline_keyboard\":[[{\"text\":\"✅ Принять\",\"callback_data\":\"approve:${PANE_ID}\"},{\"text\":\"❌ Отклонить\",\"callback_data\":\"reject:${PANE_ID}\"}]]}"
+if [ -n "$KEYBOARD" ]; then
     CURL_ARGS+=(--data-urlencode "reply_markup=$KEYBOARD")
-    TEXT="($PROJECT) 🔐 Требуется разрешение"
 fi
 
 if [ -n "$TOPIC_ID" ]; then
