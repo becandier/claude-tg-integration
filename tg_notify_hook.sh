@@ -12,13 +12,17 @@ PROJECT=$(basename "$PWD")
 PANE_ID="$TMUX_PANE"
 STOP_FLAG="/tmp/claude_code_stopped_${PANE_ID//[^a-zA-Z0-9]/_}"
 
-# Текст зависит от того, дошёл ли ответ
+# Notify-hook вызывается когда Claude ждёт ввода — ставим idle-флаг
+IDLE_FLAG="/tmp/claude_code_idle_${PANE_ID//[^a-zA-Z0-9]/_}"
+touch "$IDLE_FLAG"
+
+# Если stop-hook уже отправил ответ — не дублируем, тихо выходим
 if [ -f "$STOP_FLAG" ]; then
     rm -f "$STOP_FLAG"
-    TEXT="($PROJECT) ✅ Ждёт ввода"
-else
-    TEXT="($PROJECT) ⏳ Claude Code ждёт ввода"
+    exit 0
 fi
+
+TEXT="($PROJECT) ⏳ Claude Code ждёт ввода"
 
 # Если не в tmux — тихое уведомление без маршрутизации
 if [ -z "$TMUX" ]; then

@@ -697,15 +697,15 @@ def close_session(session_name):
 
 
 def close_topic(topic_id):
-    """Закрывает Forum Topic."""
-    resp = tg_api("closeForumTopic", {
+    """Удаляет Forum Topic."""
+    resp = tg_api("deleteForumTopic", {
         "chat_id": CHAT_ID,
         "message_thread_id": topic_id,
     })
     if resp.get("ok"):
-        logger.info(f"[Topic] Closed topic {topic_id}")
+        logger.info(f"[Topic] Deleted topic {topic_id}")
     else:
-        logger.error(f"[Topic] Failed to close {topic_id}: {resp}")
+        logger.error(f"[Topic] Failed to delete {topic_id}: {resp}")
 
 
 def close_session_by_pane(pane_id):
@@ -785,9 +785,52 @@ def handle_cleanup(msg):
 
 _last_pane_check = 0.0
 
+# Мониторинг активности pane'ов
+# pane_id -> {"sent_at": float, "last_snapshot": str, "last_change": float,
+#             "notified_working": bool, "notified_stuck": bool}
+_pane_activity = {}
+
+ACTIVITY_WORKING_TIMEOUT = 120   # 2 мин без изменений → "всё ещё работает"
+ACTIVITY_STUCK_TIMEOUT = 300     # 5 мин без изменений → "возможно завис"
+
+
+def _idle_flag_path(pane_id):
+    safe_id = re.sub(r"[^a-zA-Z0-9]", "_", pane_id)
+    return f"/tmp/claude_code_idle_{safe_id}"
+
+
+def mark_pane_waiting(pane_id):
+    """Отмечает pane как ожидающий ответа от Claude."""
+    # Убираем idle-флаг — Claude начал работать
+    try:
+        os.unlink(_idle_flag_path(pane_id))
+    except FileNotFoundError:
+        pass
+    now = time.time()
+    _pane_activity[pane_id] = {
+        "sent_at": now,
+        "last_snapshot": "",
+        "last_change": now,
+        "notified_working": False,
+        "notified_stuck": False,
+    }
+
+
+def clear_pane_waiting(pane_id):
+    """Сбрасывает ожидание (stop_hook отработал)."""
+    _pane_activity.pop(pane_id, None)
+
+
+def _capture_pane_content(pane_id):
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-15"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
 
 def check_dead_panes():
-    """Проверяет живость pane'ов, уведомляет о мёртвых и чистит ресурсы."""
+    """Проверяет живость pane'ов и активность — уведомляет о мёртвых и зависших."""
     global _last_pane_check
     now = time.time()
     if now - _last_pane_check < 30:
@@ -800,8 +843,45 @@ def check_dead_panes():
         if not pane_exists(pane_id):
             tg_send("⚠️ Сессия завершилась", topic_id=topic_id)
             cleanup_media(pane_id)
+            clear_pane_waiting(pane_id)
             tg_sessions.cleanup_pane(pane_id)
             logger.info(f"[DeadPane] pane {pane_id} dead, notified topic {topic_id}")
+            continue
+
+        # Мониторинг активности
+        activity = _pane_activity.get(pane_id)
+        if not activity:
+            continue
+
+        # idle-флаг ставится notify_hook'ом когда Claude ждёт ввода
+        if os.path.exists(_idle_flag_path(pane_id)):
+            clear_pane_waiting(pane_id)
+            continue
+
+        # stop_hook ставит флаг-файл — если есть, значит Claude ответил
+        safe_id = re.sub(r"[^a-zA-Z0-9]", "_", pane_id)
+        stop_flag = f"/tmp/claude_code_stopped_{safe_id}"
+        if os.path.exists(stop_flag):
+            clear_pane_waiting(pane_id)
+            continue
+
+        if snapshot != activity["last_snapshot"]:
+            activity["last_snapshot"] = snapshot
+            activity["last_change"] = now
+            activity["notified_working"] = False
+            activity["notified_stuck"] = False
+            continue
+
+        idle_time = now - activity["last_change"]
+
+        if idle_time >= ACTIVITY_STUCK_TIMEOUT and not activity["notified_stuck"]:
+            tg_send("⚠️ Claude не отвечает уже 5 минут — возможно завис", topic_id=topic_id)
+            activity["notified_stuck"] = True
+            logger.info(f"[Activity] pane {pane_id} stuck ({idle_time:.0f}s)")
+        elif idle_time >= ACTIVITY_WORKING_TIMEOUT and not activity["notified_working"]:
+            tg_send("⏳ Claude всё ещё работает...", topic_id=topic_id)
+            activity["notified_working"] = True
+            logger.info(f"[Activity] pane {pane_id} still working ({idle_time:.0f}s)")
 
 
 def handle_callback(callback_query):
@@ -1081,6 +1161,7 @@ def main():
             if sent:
                 tg_sessions.save_reply_to(pane_id, user_msg_id)
                 tg_react(user_msg_id)
+                mark_pane_waiting(pane_id)
                 logger.info("  OK")
             else:
                 cleanup_media(pane_id)
