@@ -40,13 +40,25 @@ REPLY_TO=$(python3 "$HELPER" get_reply_to "$PANE_ID" 2>/dev/null)
 # Forum Topic для этого pane
 TOPIC_ID=$(python3 "$HELPER" get_topic "$PANE_ID" 2>/dev/null)
 
-# Кнопки только если реально есть permission prompt в pane (оба маркера)
-PANE_CONTENT=$(/opt/homebrew/bin/tmux capture-pane -t "$PANE_ID" -p -S -10 2>/dev/null)
+# Кнопки только если реально есть permission prompt в pane.
+# Разные типы диалогов Claude Code:
+#  - Bash/команды: "Enter to confirm/proceed" + "Esc to cancel"
+#  - Edit/Write: "Do you want to ..." + нумерованный выбор + "Esc to cancel · Tab to amend"
+PANE_CONTENT=$(/opt/homebrew/bin/tmux capture-pane -t "$PANE_ID" -p -S -15 2>/dev/null)
 HAS_ESC=$(printf '%s' "$PANE_CONTENT" | grep -c "Esc to cancel")
 HAS_ENTER=$(printf '%s' "$PANE_CONTENT" | grep -cE "Enter to (confirm|proceed)")
+HAS_DOYOU=$(printf '%s' "$PANE_CONTENT" | grep -c "Do you want to")
+HAS_NUM_YES=$(printf '%s' "$PANE_CONTENT" | grep -c "1. Yes")
+HAS_NUM_NO=$(printf '%s' "$PANE_CONTENT" | grep -cE "(2\. |3\. No)")
 IS_PERMISSION=0
-if [ "$HAS_ESC" -gt 0 ] && [ "$HAS_ENTER" -gt 0 ]; then
-    IS_PERMISSION=1
+if [ "$HAS_ESC" -gt 0 ]; then
+    if [ "$HAS_ENTER" -gt 0 ]; then
+        IS_PERMISSION=1
+    elif [ "$HAS_DOYOU" -gt 0 ]; then
+        IS_PERMISSION=1
+    elif [ "$HAS_NUM_YES" -gt 0 ] && [ "$HAS_NUM_NO" -gt 0 ]; then
+        IS_PERMISSION=1
+    fi
 fi
 
 if [ "$IS_PERMISSION" -gt 0 ]; then

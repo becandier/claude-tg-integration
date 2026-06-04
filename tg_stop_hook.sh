@@ -122,14 +122,6 @@ if not msg:
     sys.exit(0)
 
 result = convert_md_to_tg_html(msg)
-# Лимит 3500 символов с корректным обрезанием (не ломаем HTML-теги)
-if len(result) > 3500:
-    result = result[:3500]
-    last_open = result.rfind("<")
-    last_close = result.rfind(">")
-    if last_open > last_close:
-        result = result[:last_open]
-    result += "\n..."
 print(result)
 ' 2>/dev/null)
 
@@ -162,38 +154,145 @@ if [ -n "$TMUX" ] && [ -n "$PANE_ID" ]; then
     TOPIC_ID=$(python3 "$HELPER" get_topic "$PANE_ID" 2>/dev/null)
 fi
 
-CURL_ARGS=(
-    -s --connect-timeout 5 --max-time 10
-    -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
-    -d "chat_id=${TG_CHAT_ID}"
-    -d "parse_mode=HTML"
-    --data-urlencode "text=$MSG"
-)
+# Разбиваем сообщение на чанки <= 4096 символов с балансировкой парных HTML-тегов
+CHUNKS_FILE=$(mktemp)
+printf '%s' "$MSG" | python3 -c '
+import sys, re, json
 
-# Без tmux — тихое уведомление
-if [ -z "$TMUX" ]; then
-    CURL_ARGS+=(-d "disable_notification=true")
-fi
+TG_LIMIT = 4096
+PAIR_TAGS = ("b", "i", "u", "s", "code", "pre", "blockquote", "span", "a", "strong", "em", "ins", "strike", "del")
+TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>")
 
-if [ -n "$TOPIC_ID" ]; then
-    CURL_ARGS+=(-d "message_thread_id=${TOPIC_ID}")
-fi
+def split_with_balance(text, limit):
+    chunks = []
+    pos = 0
+    pending_open = []
+    while pos < len(text):
+        remaining = text[pos:]
+        prefix = "".join(f"<{name}{attrs}>" for _, name, attrs in pending_open)
+        budget = limit - len(prefix)
+        if len(remaining) <= budget:
+            chunks.append(prefix + remaining)
+            return chunks
+        window = remaining[:budget]
+        cut = window.rfind("\n\n")
+        if cut < budget // 2:
+            cut = window.rfind("\n")
+        if cut < budget // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = budget
+        local_stack = list(pending_open)
+        i = 0
+        while i < cut:
+            m = TAG_RE.search(remaining, i, cut)
+            if not m:
+                break
+            closing = m.group(1) == "/"
+            name = m.group(2).lower()
+            attrs = m.group(3)
+            if name in PAIR_TAGS:
+                if closing:
+                    if local_stack and local_stack[-1][1] == name:
+                        local_stack.pop()
+                else:
+                    local_stack.append((False, name, attrs))
+            i = m.end()
+        suffix = "".join(f"</{name}>" for _, name, _ in reversed(local_stack))
+        chunks.append(prefix + remaining[:cut].rstrip() + suffix)
+        pending_open = local_stack
+        pos += cut
+        while pos < len(text) and text[pos] in " \n\t":
+            pos += 1
+    return chunks
 
-if [ -n "$REPLY_TO" ]; then
-    CURL_ARGS+=(-d "reply_to_message_id=${REPLY_TO}" -d "allow_sending_without_reply=true")
-fi
+text = sys.stdin.read()
+json.dump(split_with_balance(text, TG_LIMIT), sys.stdout, ensure_ascii=False)
+' > "$CHUNKS_FILE"
 
-RESPONSE=$(curl "${CURL_ARGS[@]}")
+NUM_CHUNKS=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$CHUNKS_FILE")
 
-# Сохраняем маршрут
-if [ -n "$TMUX" ] && [ -n "$PANE_ID" ]; then
+LAST_MSG_ID=""
+FIRST_MSG_ID=""
+for i in $(seq 0 $((NUM_CHUNKS - 1))); do
+    CHUNK=$(python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))[int(sys.argv[2])])' "$CHUNKS_FILE" "$i")
+
+    CURL_ARGS=(
+        -s --connect-timeout 5 --max-time 30
+        -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
+        -d "chat_id=${TG_CHAT_ID}"
+        -d "parse_mode=HTML"
+        --data-urlencode "text=$CHUNK"
+    )
+
+    if [ -z "$TMUX" ]; then
+        CURL_ARGS+=(-d "disable_notification=true")
+    fi
+
+    if [ -n "$TOPIC_ID" ]; then
+        CURL_ARGS+=(-d "message_thread_id=${TOPIC_ID}")
+    fi
+
+    if [ "$i" = "0" ] && [ -n "$REPLY_TO" ]; then
+        CURL_ARGS+=(-d "reply_to_message_id=${REPLY_TO}" -d "allow_sending_without_reply=true")
+    elif [ "$i" != "0" ] && [ -n "$LAST_MSG_ID" ]; then
+        CURL_ARGS+=(-d "reply_to_message_id=${LAST_MSG_ID}" -d "allow_sending_without_reply=true")
+    fi
+
+    RESPONSE=$(curl "${CURL_ARGS[@]}")
+    OK=$(printf '%s' "$RESPONSE" | python3 -c 'import sys,json
+try:
+    print(json.load(sys.stdin).get("ok", False))
+except Exception:
+    print(False)' 2>/dev/null)
+
+    # Фолбэк: невалидный HTML → отправляем без parse_mode
+    if [ "$OK" != "True" ]; then
+        PLAIN=$(printf '%s' "$CHUNK" | python3 -c '
+import sys, re
+t = sys.stdin.read()
+t = re.sub(r"<[^>]+>", "", t)
+t = t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
+sys.stdout.write(t)
+')
+        FALLBACK_ARGS=(
+            -s --connect-timeout 5 --max-time 30
+            -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
+            -d "chat_id=${TG_CHAT_ID}"
+            --data-urlencode "text=$PLAIN"
+        )
+        if [ -z "$TMUX" ]; then
+            FALLBACK_ARGS+=(-d "disable_notification=true")
+        fi
+        if [ -n "$TOPIC_ID" ]; then
+            FALLBACK_ARGS+=(-d "message_thread_id=${TOPIC_ID}")
+        fi
+        if [ "$i" = "0" ] && [ -n "$REPLY_TO" ]; then
+            FALLBACK_ARGS+=(-d "reply_to_message_id=${REPLY_TO}" -d "allow_sending_without_reply=true")
+        elif [ "$i" != "0" ] && [ -n "$LAST_MSG_ID" ]; then
+            FALLBACK_ARGS+=(-d "reply_to_message_id=${LAST_MSG_ID}" -d "allow_sending_without_reply=true")
+        fi
+        RESPONSE=$(curl "${FALLBACK_ARGS[@]}")
+    fi
+
     MSG_ID=$(printf '%s' "$RESPONSE" | python3 -c '
 import sys, json
-d = json.load(sys.stdin)
-print(d.get("result", {}).get("message_id", ""))
+try:
+    print(json.load(sys.stdin).get("result", {}).get("message_id", ""))
+except Exception:
+    pass
 ' 2>/dev/null)
 
     if [ -n "$MSG_ID" ]; then
-        python3 "$HELPER" save_route "$MSG_ID" "$PANE_ID" 2>/dev/null
+        LAST_MSG_ID="$MSG_ID"
+        if [ -z "$FIRST_MSG_ID" ]; then
+            FIRST_MSG_ID="$MSG_ID"
+        fi
     fi
+done
+
+rm -f "$CHUNKS_FILE"
+
+if [ -n "$TMUX" ] && [ -n "$PANE_ID" ] && [ -n "$FIRST_MSG_ID" ]; then
+    python3 "$HELPER" save_route "$FIRST_MSG_ID" "$PANE_ID" 2>/dev/null
 fi
