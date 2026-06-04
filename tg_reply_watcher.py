@@ -53,6 +53,19 @@ PROJECT_MARKERS = {
     ".git", "pubspec.yaml", "package.json", "Cargo.toml",
     "go.mod", "pyproject.toml", "Makefile", "CMakeLists.txt", "pom.xml",
 }
+# Папки, в которые не спускаемся при поиске вложенных проектов: они огромны
+# (тысячи файлов) и содержат "ложные" маркеры (package.json в node_modules и т.п.).
+# Спуск в них — главная причина медленного формирования списка папок.
+IGNORE_DIRS = {
+    "node_modules", ".venv", "venv", "env", "__pycache__",
+    "dist", "build", "out", "target", ".dart_tool", ".next", ".nuxt",
+    "Pods", ".gradle", ".idea", ".vscode", "vendor", ".cache",
+    "DerivedData", ".terraform", "coverage", ".pub-cache", ".cocoapods",
+}
+# TTL-кэш для результатов обхода ФС (структура папок меняется редко).
+_FS_CACHE_TTL = 30.0
+_is_project_cache = {}      # path -> (expires_at, bool)
+_nested_cache = {}          # (path, depth) -> (expires_at, bool)
 MEDIA_DIR = "/tmp/claude_tg_media"
 
 # Импортируем shared-модуль
@@ -368,17 +381,24 @@ def tmux_send_keys(pane_id, *keys):
 def is_permission_prompt(pane_id):
     """Проверяет, показан ли в pane интерактивный permission-промпт Claude Code."""
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-10"],
+        ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-15"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         return False
-    lines = result.stdout
-    # Проверяем комбинацию признаков реального промпта Claude Code,
-    # а не случайное упоминание "Esc to cancel" в тексте
-    has_esc = "Esc to cancel" in lines
-    has_enter = "Enter to confirm" in lines or "Enter to proceed" in lines
-    return has_esc and has_enter
+    content = result.stdout
+    if "Esc to cancel" not in content:
+        return False
+    # Разные типы permission-диалогов Claude Code:
+    #  - Bash/команды: "Enter to confirm/proceed"
+    #  - Edit/Write: "Do you want to make this edit/write..." + нумерованный выбор
+    if "Enter to confirm" in content or "Enter to proceed" in content:
+        return True
+    if "Do you want to" in content:
+        return True
+    if "1. Yes" in content and ("2. " in content or "3. No" in content):
+        return True
+    return False
 
 
 def wait_and_trust_folder(pane_id, timeout=15):
@@ -499,32 +519,50 @@ def handle_newstart(msg, text):
 
 def _is_project(path):
     """Проверяет, является ли директория проектом (содержит маркерный файл)."""
+    now = time.time()
+    cached = _is_project_cache.get(path)
+    if cached and cached[0] > now:
+        return cached[1]
     try:
         entries = os.listdir(path)
-    except PermissionError:
-        return False
-    return bool(PROJECT_MARKERS & set(entries))
+        result = bool(PROJECT_MARKERS & set(entries))
+    except (PermissionError, FileNotFoundError, NotADirectoryError):
+        result = False
+    _is_project_cache[path] = (now + _FS_CACHE_TTL, result)
+    return result
 
 
 def _has_nested_projects(path, depth=0):
-    """Проверяет, есть ли вложенные проекты (рекурсивно до MAX_PROJECT_DEPTH)."""
+    """Проверяет, есть ли вложенные проекты (рекурсивно до MAX_PROJECT_DEPTH).
+
+    Кэшируется по (path, depth): для конкретной папки глубина в дереве
+    детерминирована, поэтому кэш не меняет результат.
+    """
     if depth >= MAX_PROJECT_DEPTH:
         return False
+    now = time.time()
+    key = (path, depth)
+    cached = _nested_cache.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    result = False
     try:
         entries = os.listdir(path)
-    except PermissionError:
-        return False
+    except (PermissionError, FileNotFoundError, NotADirectoryError):
+        entries = []
     for entry in entries:
-        if entry.startswith("."):
+        if entry.startswith(".") or entry in IGNORE_DIRS:
             continue
         full = os.path.join(path, entry)
         if not os.path.isdir(full):
             continue
-        if _is_project(full):
-            return True
-        if _has_nested_projects(full, depth + 1):
-            return True
-    return False
+        if _is_project(full) or _has_nested_projects(full, depth + 1):
+            result = True
+            break
+
+    _nested_cache[key] = (now + _FS_CACHE_TTL, result)
+    return result
 
 
 def _folder_keyboard(rel_path=""):
@@ -561,7 +599,7 @@ def _folder_keyboard(rel_path=""):
 
     row = []
     for entry in entries:
-        if entry.startswith("."):
+        if entry.startswith(".") or entry in IGNORE_DIRS:
             continue
         full = os.path.join(abs_path, entry)
         if not os.path.isdir(full):
@@ -783,6 +821,100 @@ def handle_cleanup(msg):
     tg_send("🧹 Все медиафайлы удалены", topic_id=topic_id, reply_to=user_msg_id)
 
 
+# Нативные уровни /effort в Claude Code. Кнопка в TG дёргает реальную команду
+# `/effort <level>` в pane сессии — поэтому уровни должны совпадать с CLI.
+EFFORT_LEVELS = {
+    "low": "быстро, минимум накладных",
+    "medium": "сбалансированно",
+    "high": "глубже рассуждает",
+    "xhigh": "чуть ниже максимума (Opus 4.8/4.7)",
+    "ultracode": "xhigh + оркестрация workflow",
+}
+
+# Порядок и подписи кнопок инлайн-клавиатуры (раскладка по строкам).
+EFFORT_ROWS = [
+    [("low", "Low"), ("medium", "Medium"), ("high", "High")],
+    [("xhigh", "Xhigh"), ("ultracode", "🧠 Ultracode")],
+]
+
+
+def _effort_keyboard(current):
+    """Инлайн-клавиатура выбора эффорта; текущий уровень помечен галочкой."""
+    return [
+        [
+            {
+                "text": f"{'✅ ' if level == current else ''}{label}",
+                "callback_data": f"effort:{level}",
+            }
+            for level, label in row
+        ]
+        for row in EFFORT_ROWS
+    ]
+
+
+def _effort_text(current):
+    if current and current in EFFORT_LEVELS:
+        return f"⚙️ Эффорт reasoning: *{current}* — {EFFORT_LEVELS[current]}"
+    return "⚙️ Выбери уровень reasoning для этой сессии:"
+
+
+def set_session_effort(pane_id, level):
+    """Отправляет нативную команду `/effort <level>` в pane Claude Code."""
+    if not pane_exists(pane_id):
+        return False
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", f"/effort {level}"])
+    time.sleep(0.4)  # дать слэш-палитре закрыться перед Enter
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+    return True
+
+
+def handle_effort(msg, text):
+    """`/effort [low|medium|high|xhigh|ultracode]` — эффорт сессии текущего топика.
+
+    Без аргумента показывает инлайн-кнопки выбора.
+    """
+    user_msg_id = msg.get("message_id")
+    topic_id = get_msg_topic(msg)
+
+    if not topic_id:
+        tg_send("⚙️ /effort работает только внутри топика сессии", reply_to=user_msg_id)
+        return
+
+    pane_id = tg_sessions.get_pane_by_topic(topic_id)
+    if not pane_id:
+        tg_send("⚠️ Нет активной сессии в этом топике", topic_id=topic_id)
+        return
+
+    parts = text.split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    if not arg:
+        cur = tg_sessions.get_effort(pane_id)
+        tg_send(
+            _effort_text(cur),
+            topic_id=topic_id, parse_mode="Markdown",
+            reply_markup={"inline_keyboard": _effort_keyboard(cur)},
+        )
+        return
+
+    if arg not in EFFORT_LEVELS:
+        tg_send(
+            "⚠️ Неизвестный уровень. Доступно: `low` · `medium` · `high` · `xhigh` · `ultracode`",
+            topic_id=topic_id, parse_mode="Markdown",
+        )
+        return
+
+    if not set_session_effort(pane_id, arg):
+        tg_send("⚠️ Сессия не найдена", topic_id=topic_id)
+        return
+    tg_sessions.save_effort(pane_id, arg)
+    tg_send(
+        _effort_text(arg),
+        topic_id=topic_id, parse_mode="Markdown",
+        reply_markup={"inline_keyboard": _effort_keyboard(arg)},
+    )
+
+
 _last_pane_check = 0.0
 
 # Мониторинг активности pane'ов
@@ -986,6 +1118,36 @@ def handle_callback(callback_query):
             text = f"🔴 Сессия {session} закрыта"
 
         tg_edit(chat_msg_id, text)
+    elif data.startswith("effort:"):
+        level = data.split(":", 1)[1]
+        chat_msg_id = msg.get("message_id")
+        topic_id = get_msg_topic(msg)
+        pane_id = tg_sessions.get_pane_by_topic(topic_id) if topic_id else ""
+
+        if not pane_id or not pane_exists(pane_id):
+            tg_api("answerCallbackQuery", {
+                "callback_query_id": cb_id,
+                "text": "⚠️ Нет активной сессии",
+                "show_alert": True,
+            })
+            return
+        if level not in EFFORT_LEVELS:
+            tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
+            return
+
+        set_session_effort(pane_id, level)
+        tg_sessions.save_effort(pane_id, level)
+        tg_api("answerCallbackQuery", {
+            "callback_query_id": cb_id,
+            "text": f"Эффорт: {level}",
+        })
+        tg_edit(
+            chat_msg_id,
+            _effort_text(level),
+            parse_mode="Markdown",
+            reply_markup={"inline_keyboard": _effort_keyboard(level)},
+        )
+        logger.info(f"[Callback] effort={level} -> pane {pane_id}")
     else:
         tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
 
@@ -1004,6 +1166,7 @@ def main():
         {"command": "sessions", "description": "📋 Активные сессии"},
         {"command": "close", "description": "🔴 Закрыть сессию"},
         {"command": "cleanup", "description": "🧹 Очистить все медиафайлы"},
+        {"command": "effort", "description": "⚙️ Эффорт reasoning (low…ultracode)"},
     ])
     tg_api("setMyCommands", {"commands": commands})
     tg_api("setMyCommands", {
@@ -1084,6 +1247,12 @@ def main():
                 except Exception as e:
                     logger.error(f"[Cleanup] {e}")
                 continue
+            if cmd_text.startswith("/effort"):
+                try:
+                    handle_effort(msg, cmd_text)
+                except Exception as e:
+                    logger.error(f"[Effort] {e}")
+                continue
 
             # Текст, голосовое, фото или документ
             text = msg.get("text", "").strip()
@@ -1154,7 +1323,14 @@ def main():
                 logger.info(f"Permission decline -> pane {pane_id}")
                 sent = tmux_send_keys(pane_id, "Escape")
             else:
-                text = f"[TG | ~/.claude/tg-integration] {text}"
+                text = (
+                    f"[TG | ~/.claude/tg-integration] {text}\n\n"
+                    "[SYSTEM] Сообщение пришло из Telegram. ОБЯЗАТЕЛЬНО отвечай "
+                    "максимально кратко: 1–6 строк, без длинных списков, без "
+                    "заголовков, без блоков кода длиннее 20 строк. Лимит ответа "
+                    "— 3500 символов суммарно. Если задача требует большого ответа, "
+                    "сначала дай короткое резюме и спроси, разворачивать ли подробно."
+                )
                 logger.info(f"Reply: {text[:80]} -> pane {pane_id}")
                 sent = tmux_send(pane_id, text)
 

@@ -65,6 +65,7 @@ def _with_lock(fn):
         data.setdefault("msg_to_pane", {})
         data.setdefault("pane_to_reply", {})
         data.setdefault("pane_to_topic", {})
+        data.setdefault("pane_to_effort", {})
         fn(data)
         _save(data)
 
@@ -113,6 +114,21 @@ def get_pane_by_topic(topic_id):
     return ""
 
 
+def save_effort(pane_id, level):
+    def _do(data):
+        data.setdefault("pane_to_effort", {})
+        if level:
+            data["pane_to_effort"][pane_id] = level
+        else:
+            data["pane_to_effort"].pop(pane_id, None)
+    _with_lock(_do)
+
+
+def get_effort(pane_id):
+    data = _load()
+    return data.get("pane_to_effort", {}).get(pane_id, "")
+
+
 def cleanup_pane(pane_id):
     def _do(data):
         data["msg_to_pane"] = {
@@ -120,6 +136,7 @@ def cleanup_pane(pane_id):
         }
         data["pane_to_reply"].pop(pane_id, None)
         data.get("pane_to_topic", {}).pop(pane_id, None)
+        data.get("pane_to_effort", {}).pop(pane_id, None)
     _with_lock(_do)
 
 
@@ -136,6 +153,12 @@ if __name__ == "__main__":
         save_reply_to(sys.argv[2], sys.argv[3])
     elif cmd == "save_topic" and len(sys.argv) == 4:
         save_topic(sys.argv[2], sys.argv[3])
+    elif cmd == "save_effort" and len(sys.argv) == 4:
+        save_effort(sys.argv[2], sys.argv[3])
+    elif cmd == "get_effort" and len(sys.argv) == 3:
+        result = get_effort(sys.argv[2])
+        if result:
+            print(result)
     elif cmd == "get_pane" and len(sys.argv) == 3:
         result = get_pane(sys.argv[2])
         if result:
