@@ -915,6 +915,163 @@ def handle_effort(msg, text):
     )
 
 
+# Список моделей парсится из нативного пикера /model в pane сессии — он всегда
+# соответствует установленной версии Claude Code (модели меняются часто).
+# Фолбэк — если пикер не открылся/не распарсился (стабильные алиасы CLI).
+MODEL_FALLBACK = [
+    {"alias": "default", "label": "Default", "desc": "", "current": False},
+    {"alias": "opus", "label": "Opus", "desc": "", "current": False},
+    {"alias": "sonnet", "label": "Sonnet", "desc": "", "current": False},
+    {"alias": "haiku", "label": "Haiku", "desc": "", "current": False},
+    {"alias": "fable", "label": "Fable", "desc": "", "current": False},
+]
+
+# Строка пикера: "  ❯ 3. Fable ✔                Fable 5 · Most capable..."
+_MODEL_LINE_RE = re.compile(r"^\s*(?:❯\s*)?\d+\.\s+(.+?)\s{2,}(.+?)\s*$")
+
+
+def _capture_pane(pane_id):
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", pane_id, "-p"],
+        capture_output=True, text=True,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _input_line(pane_id):
+    """Нижняя строка ввода TUI (последняя строка с '❯')."""
+    lines = [l for l in _capture_pane(pane_id).split("\n") if l.lstrip().startswith("❯")]
+    return lines[-1] if lines else ""
+
+
+def _type_command(pane_id, command):
+    """Печатает слэш-команду и жмёт Enter, убедившись что текст дошёл целиком.
+
+    Сразу после перерисовки TUI (закрытие пикера и т.п.) часть символов может
+    теряться — тогда чистим строку (C-u) и пробуем ещё раз.
+    """
+    for attempt in range(2):
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", command])
+        time.sleep(0.5)
+        if command in _input_line(pane_id):
+            subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+            return True
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-u"])
+        time.sleep(0.3)
+    return False
+
+
+def probe_models(pane_id):
+    """Открывает пикер /model в pane, парсит модели и активную (✔), закрывает Esc.
+
+    Возвращает [{alias, label, desc, current}] или None, если пикер не открылся.
+    """
+    if not pane_exists(pane_id):
+        return None
+    if not _type_command(pane_id, "/model"):
+        return None
+    time.sleep(2)
+    out = _capture_pane(pane_id)
+    if "Select model" not in out:
+        # Пикер не открылся — Escape не шлём (мог бы прервать текущий ход),
+        # только чистим возможный остаток ввода.
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-u"])
+        return None
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, "Escape"])
+    models = []
+    for line in out.split("Select model", 1)[1].split("\n"):
+        m = _MODEL_LINE_RE.match(line)
+        if not m:
+            continue
+        label, desc = m.group(1).strip(), m.group(2).strip()
+        current = "✔" in label or "✔" in desc
+        label = label.replace("✔", "").strip()
+        alias = label.split()[0].lower().strip(".")
+        if not alias.isalpha():
+            continue
+        models.append({
+            "alias": alias, "label": label,
+            "desc": desc.replace("✔", "").strip(), "current": current,
+        })
+    return models or None
+
+
+def _model_keyboard(models, current):
+    """Одна модель — одна кнопка-строка; активная помечена галочкой."""
+    rows = []
+    for m in models:
+        text = m["label"]
+        if m["desc"]:
+            text += " — " + m["desc"].split("·")[0].strip()
+        if m["alias"] == current:
+            text = "✅ " + text
+        rows.append([{"text": text[:60], "callback_data": f"model:{m['alias']}"}])
+    return rows
+
+
+def _model_text(current):
+    if current:
+        return f"🤖 Модель сессии: *{current}*"
+    return "🤖 Выбери модель для этой сессии:"
+
+
+def set_session_model(pane_id, alias):
+    """Отправляет нативную команду `/model <alias>` в pane Claude Code."""
+    if not pane_exists(pane_id):
+        return False
+    return _type_command(pane_id, f"/model {alias}")
+
+
+def handle_model(msg, text):
+    """`/model [alias|полное-имя]` — модель сессии текущего топика.
+
+    Без аргумента парсит живой пикер /model (актуальный список + активная
+    модель) и показывает инлайн-кнопки.
+    """
+    user_msg_id = msg.get("message_id")
+    topic_id = get_msg_topic(msg)
+
+    if not topic_id:
+        tg_send("🤖 /model работает только внутри топика сессии", reply_to=user_msg_id)
+        return
+
+    pane_id = tg_sessions.get_pane_by_topic(topic_id)
+    if not pane_id:
+        tg_send("⚠️ Нет активной сессии в этом топике", topic_id=topic_id)
+        return
+
+    parts = text.split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    if not arg:
+        models = probe_models(pane_id)
+        note = ""
+        if models is None:
+            models = MODEL_FALLBACK
+            note = "\n⚠️ Не смог прочитать пикер — список может быть неполным"
+        current = next(
+            (m["alias"] for m in models if m["current"]),
+            tg_sessions.get_model(pane_id),
+        )
+        if current:
+            tg_sessions.save_model(pane_id, current)
+        tg_send(
+            _model_text(current) + note,
+            topic_id=topic_id, parse_mode="Markdown",
+            reply_markup={"inline_keyboard": _model_keyboard(models, current)},
+        )
+        return
+
+    if not re.fullmatch(r"[a-z0-9.\-]+", arg):
+        tg_send("⚠️ Некорректное имя модели", topic_id=topic_id)
+        return
+    if not set_session_model(pane_id, arg):
+        tg_send("⚠️ Сессия не найдена", topic_id=topic_id)
+        return
+    tg_sessions.save_model(pane_id, arg)
+    tg_send(_model_text(arg), topic_id=topic_id, parse_mode="Markdown")
+
+
 _last_pane_check = 0.0
 
 # Мониторинг активности pane'ов
@@ -1148,6 +1305,48 @@ def handle_callback(callback_query):
             reply_markup={"inline_keyboard": _effort_keyboard(level)},
         )
         logger.info(f"[Callback] effort={level} -> pane {pane_id}")
+    elif data.startswith("model:"):
+        alias = data.split(":", 1)[1]
+        chat_msg_id = msg.get("message_id")
+        topic_id = get_msg_topic(msg)
+        pane_id = tg_sessions.get_pane_by_topic(topic_id) if topic_id else ""
+
+        if not pane_id or not pane_exists(pane_id):
+            tg_api("answerCallbackQuery", {
+                "callback_query_id": cb_id,
+                "text": "⚠️ Нет активной сессии",
+                "show_alert": True,
+            })
+            return
+
+        set_session_model(pane_id, alias)
+        tg_sessions.save_model(pane_id, alias)
+        tg_api("answerCallbackQuery", {
+            "callback_query_id": cb_id,
+            "text": f"Модель: {alias}",
+        })
+        # Клавиатуру не перестраиваем с нуля — двигаем галочку в существующей
+        kb = (msg.get("reply_markup") or {}).get("inline_keyboard") or []
+        new_kb = []
+        for row in kb:
+            new_row = []
+            for btn in row:
+                base = btn.get("text", "")
+                if base.startswith("✅ "):
+                    base = base[len("✅ "):]
+                cb_data = btn.get("callback_data", "")
+                new_row.append({
+                    "text": ("✅ " + base) if cb_data == data else base,
+                    "callback_data": cb_data,
+                })
+            new_kb.append(new_row)
+        tg_edit(
+            chat_msg_id,
+            _model_text(alias),
+            parse_mode="Markdown",
+            reply_markup={"inline_keyboard": new_kb},
+        )
+        logger.info(f"[Callback] model={alias} -> pane {pane_id}")
     else:
         tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
 
@@ -1167,6 +1366,7 @@ def main():
         {"command": "close", "description": "🔴 Закрыть сессию"},
         {"command": "cleanup", "description": "🧹 Очистить все медиафайлы"},
         {"command": "effort", "description": "⚙️ Эффорт reasoning (low…ultracode)"},
+        {"command": "model", "description": "🤖 Модель Claude (список из живого пикера)"},
     ])
     tg_api("setMyCommands", {"commands": commands})
     tg_api("setMyCommands", {
@@ -1253,6 +1453,12 @@ def main():
                 except Exception as e:
                     logger.error(f"[Effort] {e}")
                 continue
+            if cmd_text.startswith("/model"):
+                try:
+                    handle_model(msg, cmd_text)
+                except Exception as e:
+                    logger.error(f"[Model] {e}")
+                continue
 
             # Текст, голосовое, фото или документ
             text = msg.get("text", "").strip()
@@ -1325,11 +1531,8 @@ def main():
             else:
                 text = (
                     f"[TG | ~/.claude/tg-integration] {text}\n\n"
-                    "[SYSTEM] Сообщение пришло из Telegram. ОБЯЗАТЕЛЬНО отвечай "
-                    "максимально кратко: 1–6 строк, без длинных списков, без "
-                    "заголовков, без блоков кода длиннее 20 строк. Лимит ответа "
-                    "— 3500 символов суммарно. Если задача требует большого ответа, "
-                    "сначала дай короткое резюме и спроси, разворачивать ли подробно."
+                    "[SYSTEM] Сообщение из Telegram — примени скилл tg-chat "
+                    "(правила ответа и отправка файлов там). Отвечай кратко."
                 )
                 logger.info(f"Reply: {text[:80]} -> pane {pane_id}")
                 sent = tmux_send(pane_id, text)

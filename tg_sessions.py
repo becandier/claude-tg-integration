@@ -129,6 +129,21 @@ def get_effort(pane_id):
     return data.get("pane_to_effort", {}).get(pane_id, "")
 
 
+def save_model(pane_id, alias):
+    def _do(data):
+        data.setdefault("pane_to_model", {})
+        if alias:
+            data["pane_to_model"][pane_id] = alias
+        else:
+            data["pane_to_model"].pop(pane_id, None)
+    _with_lock(_do)
+
+
+def get_model(pane_id):
+    data = _load()
+    return data.get("pane_to_model", {}).get(pane_id, "")
+
+
 def cleanup_pane(pane_id):
     def _do(data):
         data["msg_to_pane"] = {
@@ -137,6 +152,7 @@ def cleanup_pane(pane_id):
         data["pane_to_reply"].pop(pane_id, None)
         data.get("pane_to_topic", {}).pop(pane_id, None)
         data.get("pane_to_effort", {}).pop(pane_id, None)
+        data.get("pane_to_model", {}).pop(pane_id, None)
     _with_lock(_do)
 
 
@@ -157,6 +173,12 @@ if __name__ == "__main__":
         save_effort(sys.argv[2], sys.argv[3])
     elif cmd == "get_effort" and len(sys.argv) == 3:
         result = get_effort(sys.argv[2])
+        if result:
+            print(result)
+    elif cmd == "save_model" and len(sys.argv) == 4:
+        save_model(sys.argv[2], sys.argv[3])
+    elif cmd == "get_model" and len(sys.argv) == 3:
+        result = get_model(sys.argv[2])
         if result:
             print(result)
     elif cmd == "get_pane" and len(sys.argv) == 3:
