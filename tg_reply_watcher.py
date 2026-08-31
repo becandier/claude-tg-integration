@@ -1531,8 +1531,7 @@ def main():
             else:
                 text = (
                     f"[TG | ~/.claude/tg-integration] {text}\n\n"
-                    "[SYSTEM] Сообщение из Telegram — примени скилл tg-chat "
-                    "(правила ответа и отправка файлов там). Отвечай кратко."
+                    "[SYSTEM] Сообщение из Telegram — примени скилл tg-chat."
                 )
                 logger.info(f"Reply: {text[:80]} -> pane {pane_id}")
                 sent = tmux_send(pane_id, text)
