@@ -66,6 +66,7 @@ def _with_lock(fn):
         data.setdefault("pane_to_reply", {})
         data.setdefault("pane_to_topic", {})
         data.setdefault("pane_to_effort", {})
+        data.setdefault("pane_to_agent", {})
         fn(data)
         _save(data)
 
@@ -144,6 +145,17 @@ def get_model(pane_id):
     return data.get("pane_to_model", {}).get(pane_id, "")
 
 
+def save_agent(pane_id, agent):
+    def _do(data):
+        data.setdefault("pane_to_agent", {})[pane_id] = agent
+    _with_lock(_do)
+
+
+def get_agent(pane_id):
+    data = _load()
+    return data.get("pane_to_agent", {}).get(pane_id, "claude")
+
+
 def cleanup_pane(pane_id):
     def _do(data):
         data["msg_to_pane"] = {
@@ -153,6 +165,7 @@ def cleanup_pane(pane_id):
         data.get("pane_to_topic", {}).pop(pane_id, None)
         data.get("pane_to_effort", {}).pop(pane_id, None)
         data.get("pane_to_model", {}).pop(pane_id, None)
+        data.get("pane_to_agent", {}).pop(pane_id, None)
     _with_lock(_do)
 
 
