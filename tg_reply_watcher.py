@@ -77,7 +77,10 @@ from agent_runtime import (
     build_launch_argv,
     is_managed_session,
     make_session_name,
+    parse_codex_effort_picker,
+    parse_codex_model_picker,
     parse_newstart_args,
+    picker_navigation_keys,
     project_callback_data,
     resolve_project_dir,
 )
@@ -886,7 +889,7 @@ def handle_cleanup(msg):
 
 # Нативные уровни /effort в Claude Code. Кнопка в TG дёргает реальную команду
 # `/effort <level>` в pane сессии — поэтому уровни должны совпадать с CLI.
-EFFORT_LEVELS = {
+CLAUDE_EFFORT_LEVELS = {
     "low": "быстро, минимум накладных",
     "medium": "сбалансированно",
     "high": "глубже рассуждает",
@@ -894,15 +897,30 @@ EFFORT_LEVELS = {
     "ultracode": "xhigh + оркестрация workflow",
 }
 
+CODEX_EFFORT_LEVELS = {
+    "low": "быстро, лёгкое рассуждение",
+    "medium": "баланс скорости и глубины",
+    "high": "глубокое рассуждение",
+    "xhigh": "максимум основного списка",
+    "max": "сложные задачи, повышенный расход",
+    "ultra": "оркестрация нескольких агентов",
+}
+
 # Порядок и подписи кнопок инлайн-клавиатуры (раскладка по строкам).
-EFFORT_ROWS = [
+CLAUDE_EFFORT_ROWS = [
     [("low", "Low"), ("medium", "Medium"), ("high", "High")],
     [("xhigh", "Xhigh"), ("ultracode", "🧠 Ultracode")],
 ]
 
+CODEX_EFFORT_ROWS = [
+    [("low", "Low"), ("medium", "Medium"), ("high", "High")],
+    [("xhigh", "Xhigh"), ("max", "Max"), ("ultra", "Ultra")],
+]
 
-def _effort_keyboard(current):
+
+def _effort_keyboard(current, agent=AgentKind.CLAUDE):
     """Инлайн-клавиатура выбора эффорта; текущий уровень помечен галочкой."""
+    rows = CODEX_EFFORT_ROWS if agent is AgentKind.CODEX else CLAUDE_EFFORT_ROWS
     return [
         [
             {
@@ -911,20 +929,23 @@ def _effort_keyboard(current):
             }
             for level, label in row
         ]
-        for row in EFFORT_ROWS
+        for row in rows
     ]
 
 
-def _effort_text(current):
-    if current and current in EFFORT_LEVELS:
-        return f"⚙️ Эффорт reasoning: *{current}* — {EFFORT_LEVELS[current]}"
+def _effort_text(current, agent=AgentKind.CLAUDE):
+    levels = CODEX_EFFORT_LEVELS if agent is AgentKind.CODEX else CLAUDE_EFFORT_LEVELS
+    if current and current in levels:
+        return f"⚙️ Эффорт reasoning: *{current}* — {levels[current]}"
     return "⚙️ Выбери уровень reasoning для этой сессии:"
 
 
-def set_session_effort(pane_id, level):
+def set_session_effort(pane_id, level, agent=AgentKind.CLAUDE):
     """Отправляет нативную команду `/effort <level>` в pane Claude Code."""
     if not pane_exists(pane_id):
         return False
+    if agent is AgentKind.CODEX:
+        return _set_codex_effort(pane_id, level)
     subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", f"/effort {level}"])
     time.sleep(0.4)  # дать слэш-палитре закрыться перед Enter
     subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"])
@@ -948,33 +969,37 @@ def handle_effort(msg, text):
         tg_send("⚠️ Нет активной сессии в этом топике", topic_id=topic_id)
         return
 
+    agent = AgentKind(tg_sessions.get_agent(pane_id))
+    levels = CODEX_EFFORT_LEVELS if agent is AgentKind.CODEX else CLAUDE_EFFORT_LEVELS
+
     parts = text.split(maxsplit=1)
     arg = parts[1].strip().lower() if len(parts) > 1 else ""
 
     if not arg:
         cur = tg_sessions.get_effort(pane_id)
         tg_send(
-            _effort_text(cur),
+            _effort_text(cur, agent),
             topic_id=topic_id, parse_mode="Markdown",
-            reply_markup={"inline_keyboard": _effort_keyboard(cur)},
+            reply_markup={"inline_keyboard": _effort_keyboard(cur, agent)},
         )
         return
 
-    if arg not in EFFORT_LEVELS:
+    if arg not in levels:
         tg_send(
-            "⚠️ Неизвестный уровень. Доступно: `low` · `medium` · `high` · `xhigh` · `ultracode`",
+            "⚠️ Неизвестный уровень. Доступно: "
+            + " · ".join(f"`{level}`" for level in levels),
             topic_id=topic_id, parse_mode="Markdown",
         )
         return
 
-    if not set_session_effort(pane_id, arg):
-        tg_send("⚠️ Сессия не найдена", topic_id=topic_id)
+    if not set_session_effort(pane_id, arg, agent):
+        tg_send("⚠️ Не удалось изменить effort в активной сессии", topic_id=topic_id)
         return
     tg_sessions.save_effort(pane_id, arg)
     tg_send(
-        _effort_text(arg),
+        _effort_text(arg, agent),
         topic_id=topic_id, parse_mode="Markdown",
-        reply_markup={"inline_keyboard": _effort_keyboard(arg)},
+        reply_markup={"inline_keyboard": _effort_keyboard(arg, agent)},
     )
 
 
@@ -1002,8 +1027,11 @@ def _capture_pane(pane_id):
 
 
 def _input_line(pane_id):
-    """Нижняя строка ввода TUI (последняя строка с '❯')."""
-    lines = [l for l in _capture_pane(pane_id).split("\n") if l.lstrip().startswith("❯")]
+    """Нижняя строка ввода Claude (`❯`) или Codex (`›`)."""
+    lines = [
+        line for line in _capture_pane(pane_id).split("\n")
+        if line.lstrip().startswith(("❯", "›"))
+    ]
     return lines[-1] if lines else ""
 
 
@@ -1024,13 +1052,86 @@ def _type_command(pane_id, command):
     return False
 
 
-def probe_models(pane_id):
+def _wait_for_picker(pane_id, marker, timeout=3.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        output = _capture_pane(pane_id)
+        if marker in output:
+            return output
+        time.sleep(0.2)
+    return ""
+
+
+def _open_codex_model_picker(pane_id):
+    if not pane_exists(pane_id) or not _type_command(pane_id, "/model"):
+        return ""
+    return _wait_for_picker(pane_id, "Select Model and Effort")
+
+
+def _choose_picker_option(pane_id, options, target):
+    try:
+        keys = picker_navigation_keys(options, target)
+    except ValueError:
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "Escape"])
+        return False
+    if keys:
+        tmux_send_keys(pane_id, *keys)
+    tmux_send_keys(pane_id, "Enter")
+    return True
+
+
+def _choose_codex_effort_from_open_picker(pane_id, level):
+    output = _wait_for_picker(pane_id, "Select Reasoning Level")
+    options = parse_codex_effort_picker(output)
+    if not options:
+        return False
+    if level in ("max", "ultra"):
+        if not _choose_picker_option(pane_id, options, "more"):
+            return False
+        advanced = _wait_for_picker(pane_id, "Advanced Reasoning")
+        return _choose_picker_option(
+            pane_id,
+            parse_codex_effort_picker(advanced),
+            level,
+        )
+    return _choose_picker_option(pane_id, options, level)
+
+
+def _set_codex_effort(pane_id, level):
+    output = _open_codex_model_picker(pane_id)
+    models = parse_codex_model_picker(output)
+    current = next((option for option in models if option.selected), None)
+    if current is None or not _choose_picker_option(pane_id, models, current.value):
+        return False
+    return _choose_codex_effort_from_open_picker(pane_id, level)
+
+
+def _probe_codex_models(pane_id):
+    output = _open_codex_model_picker(pane_id)
+    options = parse_codex_model_picker(output)
+    if not options:
+        return None
+    tmux_send_keys(pane_id, "Escape")
+    return [
+        {
+            "alias": option.value,
+            "label": option.label,
+            "desc": "",
+            "current": option.current,
+        }
+        for option in options
+    ]
+
+
+def probe_models(pane_id, agent=AgentKind.CLAUDE):
     """Открывает пикер /model в pane, парсит модели и активную (✔), закрывает Esc.
 
     Возвращает [{alias, label, desc, current}] или None, если пикер не открылся.
     """
     if not pane_exists(pane_id):
         return None
+    if agent is AgentKind.CODEX:
+        return _probe_codex_models(pane_id)
     if not _type_command(pane_id, "/model"):
         return None
     time.sleep(2)
@@ -1078,10 +1179,29 @@ def _model_text(current):
     return "🤖 Выбери модель для этой сессии:"
 
 
-def set_session_model(pane_id, alias):
-    """Отправляет нативную команду `/model <alias>` в pane Claude Code."""
+def _set_codex_model(pane_id, alias):
+    output = _open_codex_model_picker(pane_id)
+    models = parse_codex_model_picker(output)
+    if not models or not _choose_picker_option(pane_id, models, alias):
+        return False
+    effort = tg_sessions.get_effort(pane_id)
+    if effort in CODEX_EFFORT_LEVELS:
+        return _choose_codex_effort_from_open_picker(pane_id, effort)
+    reasoning_output = _wait_for_picker(pane_id, "Select Reasoning Level")
+    reasoning_options = parse_codex_effort_picker(reasoning_output)
+    current = next((option for option in reasoning_options if option.selected), None)
+    return bool(
+        current
+        and _choose_picker_option(pane_id, reasoning_options, current.value)
+    )
+
+
+def set_session_model(pane_id, alias, agent=AgentKind.CLAUDE):
+    """Меняет модель через нативный интерфейс активного агента."""
     if not pane_exists(pane_id):
         return False
+    if agent is AgentKind.CODEX:
+        return _set_codex_model(pane_id, alias)
     return _type_command(pane_id, f"/model {alias}")
 
 
@@ -1103,14 +1223,25 @@ def handle_model(msg, text):
         tg_send("⚠️ Нет активной сессии в этом топике", topic_id=topic_id)
         return
 
+    agent = AgentKind(tg_sessions.get_agent(pane_id))
+
     parts = text.split(maxsplit=1)
     arg = parts[1].strip().lower() if len(parts) > 1 else ""
 
     if not arg:
-        models = probe_models(pane_id)
+        models = probe_models(pane_id, agent)
         note = ""
         if models is None:
-            models = MODEL_FALLBACK
+            if agent is AgentKind.CODEX:
+                saved = tg_sessions.get_model(pane_id)
+                models = ([{
+                    "alias": saved,
+                    "label": saved,
+                    "desc": "",
+                    "current": True,
+                }] if saved else [])
+            else:
+                models = MODEL_FALLBACK
             note = "\n⚠️ Не смог прочитать пикер — список может быть неполным"
         current = next(
             (m["alias"] for m in models if m["current"]),
@@ -1128,8 +1259,8 @@ def handle_model(msg, text):
     if not re.fullmatch(r"[a-z0-9.\-]+", arg):
         tg_send("⚠️ Некорректное имя модели", topic_id=topic_id)
         return
-    if not set_session_model(pane_id, arg):
-        tg_send("⚠️ Сессия не найдена", topic_id=topic_id)
+    if not set_session_model(pane_id, arg, agent):
+        tg_send("⚠️ Не удалось изменить модель в активной сессии", topic_id=topic_id)
         return
     tg_sessions.save_model(pane_id, arg)
     tg_send(_model_text(arg), topic_id=topic_id, parse_mode="Markdown")
@@ -1257,6 +1388,14 @@ def handle_callback(callback_query):
             tg_edit(chat_msg_id, f"{original_text}\n\n⚠️ Сессия не найдена")
             return
 
+        if tg_sessions.get_agent(pane_id) != AgentKind.CLAUDE.value:
+            tg_api("answerCallbackQuery", {
+                "callback_query_id": cb_id,
+                "text": "⚠️ Codex запущен без approval-диалогов",
+                "show_alert": True,
+            })
+            return
+
         if not is_permission_prompt(pane_id):
             tg_api("answerCallbackQuery", {
                 "callback_query_id": cb_id,
@@ -1364,11 +1503,19 @@ def handle_callback(callback_query):
                 "show_alert": True,
             })
             return
-        if level not in EFFORT_LEVELS:
+        agent = AgentKind(tg_sessions.get_agent(pane_id))
+        levels = CODEX_EFFORT_LEVELS if agent is AgentKind.CODEX else CLAUDE_EFFORT_LEVELS
+        if level not in levels:
             tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
             return
 
-        set_session_effort(pane_id, level)
+        if not set_session_effort(pane_id, level, agent):
+            tg_api("answerCallbackQuery", {
+                "callback_query_id": cb_id,
+                "text": "⚠️ Не удалось изменить effort",
+                "show_alert": True,
+            })
+            return
         tg_sessions.save_effort(pane_id, level)
         tg_api("answerCallbackQuery", {
             "callback_query_id": cb_id,
@@ -1376,9 +1523,9 @@ def handle_callback(callback_query):
         })
         tg_edit(
             chat_msg_id,
-            _effort_text(level),
+            _effort_text(level, agent),
             parse_mode="Markdown",
-            reply_markup={"inline_keyboard": _effort_keyboard(level)},
+            reply_markup={"inline_keyboard": _effort_keyboard(level, agent)},
         )
         logger.info(f"[Callback] effort={level} -> pane {pane_id}")
     elif data.startswith("model:"):
@@ -1395,7 +1542,14 @@ def handle_callback(callback_query):
             })
             return
 
-        set_session_model(pane_id, alias)
+        agent = AgentKind(tg_sessions.get_agent(pane_id))
+        if not set_session_model(pane_id, alias, agent):
+            tg_api("answerCallbackQuery", {
+                "callback_query_id": cb_id,
+                "text": "⚠️ Не удалось изменить модель",
+                "show_alert": True,
+            })
+            return
         tg_sessions.save_model(pane_id, alias)
         tg_api("answerCallbackQuery", {
             "callback_query_id": cb_id,
@@ -1436,13 +1590,13 @@ def main():
 
     # Регистрируем команды бота (для меню в группе и в приватном чате)
     commands = json.dumps([
-        {"command": "newstart", "description": "🚀 Новая сессия Claude Code"},
+        {"command": "newstart", "description": "🚀 Новая сессия Claude или Codex"},
         {"command": "projects", "description": "📁 Список проектов"},
         {"command": "sessions", "description": "📋 Активные сессии"},
         {"command": "close", "description": "🔴 Закрыть сессию"},
         {"command": "cleanup", "description": "🧹 Очистить все медиафайлы"},
-        {"command": "effort", "description": "⚙️ Эффорт reasoning (low…ultracode)"},
-        {"command": "model", "description": "🤖 Модель Claude (список из живого пикера)"},
+        {"command": "effort", "description": "⚙️ Эффорт активного агента"},
+        {"command": "model", "description": "🤖 Модель активного агента"},
     ])
     tg_api("setMyCommands", {"commands": commands})
     tg_api("setMyCommands", {
@@ -1598,10 +1752,19 @@ def main():
 
             # Quick replies для permission-промптов (Do you want to make this edit?)
             lower = text.lower()
-            if lower in ("y", "yes", "да", "1", "ок", "ok", "+") and is_permission_prompt(pane_id):
+            is_claude = tg_sessions.get_agent(pane_id) == AgentKind.CLAUDE.value
+            if (
+                is_claude
+                and lower in ("y", "yes", "да", "1", "ок", "ok", "+")
+                and is_permission_prompt(pane_id)
+            ):
                 logger.info(f"Permission confirm -> pane {pane_id}")
                 sent = tmux_send_keys(pane_id, "Enter")
-            elif lower in ("n", "no", "нет", "3", "-") and is_permission_prompt(pane_id):
+            elif (
+                is_claude
+                and lower in ("n", "no", "нет", "3", "-")
+                and is_permission_prompt(pane_id)
+            ):
                 logger.info(f"Permission decline -> pane {pane_id}")
                 sent = tmux_send_keys(pane_id, "Escape")
             else:
