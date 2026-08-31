@@ -1,6 +1,15 @@
 import unittest
 
-from agent_runtime import AgentKind, LaunchSpec, build_launch_argv, parse_newstart_args
+from agent_runtime import (
+    AgentKind,
+    LaunchSpec,
+    build_launch_argv,
+    is_managed_session,
+    make_session_name,
+    parse_newstart_args,
+    project_callback_data,
+    resolve_project_dir,
+)
 
 
 class ParseNewStartArgsTests(unittest.TestCase):
@@ -70,6 +79,33 @@ class BuildLaunchArgvTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "model"):
             build_launch_argv(spec)
+
+
+class SessionLifecycleTests(unittest.TestCase):
+    def test_session_name_contains_agent_kind(self):
+        self.assertEqual(make_session_name(AgentKind.CLAUDE, 123), "claude-123")
+        self.assertEqual(make_session_name(AgentKind.CODEX, 123), "codex-123")
+
+    def test_recognizes_only_managed_session_prefixes(self):
+        self.assertTrue(is_managed_session("claude-123"))
+        self.assertTrue(is_managed_session("codex-123"))
+        self.assertFalse(is_managed_session("shell-123"))
+
+    def test_claude_project_callback_stays_backward_compatible(self):
+        self.assertEqual(
+            project_callback_data(AgentKind.CLAUDE, "mobile"),
+            "start:mobile",
+        )
+
+    def test_codex_project_callback_keeps_agent_kind(self):
+        self.assertEqual(
+            project_callback_data(AgentKind.CODEX, "mobile"),
+            "start:codex:mobile",
+        )
+
+    def test_project_path_cannot_escape_projects_root(self):
+        with self.assertRaisesRegex(ValueError, "project path"):
+            resolve_project_dir("../private", "/Users/me/projects", "/Users/me")
 
 
 if __name__ == "__main__":

@@ -71,6 +71,16 @@ MEDIA_DIR = "/tmp/claude_tg_media"
 # Импортируем shared-модуль
 sys.path.insert(0, os.path.expanduser("~/.claude/tg-integration"))
 import tg_sessions
+from agent_runtime import (
+    AgentKind,
+    LaunchSpec,
+    build_launch_argv,
+    is_managed_session,
+    make_session_name,
+    parse_newstart_args,
+    project_callback_data,
+    resolve_project_dir,
+)
 
 logger = logging.getLogger("watcher")
 
@@ -437,44 +447,56 @@ def cleanup_pid(*_):
 # ── Команды бота ──────────────────────────────────────────────
 
 def handle_newstart(msg, text):
-    """Создаёт новую tmux-сессию с Claude Code."""
-    parts = text.split(maxsplit=1)
-    project = parts[1].strip() if len(parts) > 1 else None
+    """Создаёт новую tmux-сессию с Claude Code или Codex CLI."""
+    agent, project = parse_newstart_args(text)
     user_msg_id = msg.get("message_id")
     src_topic = get_msg_topic(msg)
 
     if not project:
-        handle_projects(msg)
+        handle_projects(msg, agent=agent)
         return
 
-    if project == "__home__":
-        project_dir = os.path.expanduser("~")
-    elif project == "__projects__":
-        project_dir = PROJECTS_ROOT
-    else:
-        project_dir = os.path.join(PROJECTS_ROOT, project)
+    try:
+        project_dir = resolve_project_dir(
+            project,
+            PROJECTS_ROOT,
+            os.path.expanduser("~"),
+        )
+    except ValueError:
+        tg_send("❌ Недопустимый путь проекта", topic_id=src_topic, reply_to=user_msg_id)
+        return
     if not os.path.isdir(project_dir):
         tg_send(f"❌ Проект не найден: {project}", topic_id=src_topic, reply_to=user_msg_id)
         return
 
-    session_name = f"claude-{int(time.time())}"
+    executable = agent.value
+    if shutil.which(executable) is None:
+        tg_send(
+            f"❌ CLI не найден: {executable}",
+            topic_id=src_topic,
+            reply_to=user_msg_id,
+        )
+        return
+
+    session_name = make_session_name(agent, int(time.time()))
     project_name = os.path.basename(project_dir)
+    agent_name = "Claude Code" if agent is AgentKind.CLAUDE else "Codex"
 
     tg_react(user_msg_id, "⚡")
 
     # Создаём Forum Topic для этой сессии
-    topic_id = create_forum_topic(f"🚀 {project_name}")
+    topic_id = create_forum_topic(f"🚀 {agent_name} · {project_name}")
     if not topic_id:
         tg_send("❌ Не удалось создать топик", topic_id=src_topic, reply_to=user_msg_id)
         return
 
-    shell_cmd = (
-        f"claude --dangerously-skip-permissions; "
-        f"tmux wait-for -S {session_name}-done"
+    launch_spec = LaunchSpec(
+        agent=agent,
+        session_name=session_name,
+        project_dir=project_dir,
     )
     result = subprocess.run(
-        ["tmux", "new-session", "-d", "-s", session_name, "-c", project_dir,
-         f"zsh -l -c '{shell_cmd}'"],
+        build_launch_argv(launch_spec),
         capture_output=True, text=True,
     )
 
@@ -483,6 +505,7 @@ def handle_newstart(msg, text):
             f"❌ Не удалось создать сессию:\n{result.stderr[:200]}",
             topic_id=topic_id, reply_to=user_msg_id,
         )
+        close_topic(topic_id)
         return
 
     result = subprocess.run(
@@ -493,18 +516,22 @@ def handle_newstart(msg, text):
 
     if not pane_id:
         tg_send("❌ Сессия создана, но не удалось получить pane_id", topic_id=topic_id)
+        subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+        close_topic(topic_id)
         return
 
     # Сохраняем маппинг pane → topic
     tg_sessions.save_topic(pane_id, topic_id)
+    tg_sessions.save_agent(pane_id, agent.value)
 
     # Автоматически подтверждаем trust-промпт в фоне (не блокируя polling)
-    threading.Thread(
-        target=wait_and_trust_folder, args=(pane_id,), daemon=True
-    ).start()
+    if agent is AgentKind.CLAUDE:
+        threading.Thread(
+            target=wait_and_trust_folder, args=(pane_id,), daemon=True
+        ).start()
 
     response = tg_send(
-        f"🚀 Claude Code запущен\nПроект: {project_name}\nСессия: {session_name}",
+        f"🚀 {agent_name} запущен\nПроект: {project_name}\nСессия: {session_name}",
         topic_id=topic_id,
     )
 
@@ -514,7 +541,10 @@ def handle_newstart(msg, text):
 
     tg_sessions.save_reply_to(pane_id, user_msg_id)
     open_terminal_with_tmux(session_name)
-    logger.info(f"[NewStart] session={session_name} pane={pane_id} topic={topic_id} project={project_name}")
+    logger.info(
+        f"[NewStart] agent={agent.value} session={session_name} pane={pane_id} "
+        f"topic={topic_id} project={project_name}"
+    )
 
 
 def _is_project(path):
@@ -565,7 +595,7 @@ def _has_nested_projects(path, depth=0):
     return result
 
 
-def _folder_keyboard(rel_path=""):
+def _folder_keyboard(rel_path="", agent=AgentKind.CLAUDE):
     """Инлайн-клавиатура для папки (drill-down навигация).
 
     rel_path — путь относительно PROJECTS_ROOT ("" = корень).
@@ -582,14 +612,24 @@ def _folder_keyboard(rel_path=""):
     # Кнопка "Назад" и "Выбрать эту папку" если не в корне
     if rel_path:
         parent = "/".join(rel_path.split("/")[:-1])
-        keyboard.append([{"text": "← Назад", "callback_data": f"nav:{parent}"}])
-        keyboard.append([{"text": "📌 Выбрать эту папку", "callback_data": f"start:{rel_path}"}])
+        nav_prefix = "nav:codex:" if agent is AgentKind.CODEX else "nav:"
+        keyboard.append([{"text": "← Назад", "callback_data": f"{nav_prefix}{parent}"}])
+        keyboard.append([{
+            "text": "📌 Выбрать эту папку",
+            "callback_data": project_callback_data(agent, rel_path),
+        }])
 
     # Специальные кнопки только в корне
     if not rel_path:
         keyboard.append([
-            {"text": "🏠 Домашняя директория", "callback_data": "start:__home__"},
-            {"text": "🆕 ~/projects", "callback_data": "start:__projects__"},
+            {
+                "text": "🏠 Домашняя директория",
+                "callback_data": project_callback_data(agent, "__home__"),
+            },
+            {
+                "text": "🆕 ~/projects",
+                "callback_data": project_callback_data(agent, "__projects__"),
+            },
         ])
 
     try:
@@ -615,14 +655,32 @@ def _folder_keyboard(rel_path=""):
                 keyboard.append(row)
                 row = []
             keyboard.append([
-                {"text": f"📂 {entry}", "callback_data": f"start:{entry_rel}"},
-                {"text": f"📁 {entry} →", "callback_data": f"nav:{entry_rel}"},
+                {
+                    "text": f"📂 {entry}",
+                    "callback_data": project_callback_data(agent, entry_rel),
+                },
+                {
+                    "text": f"📁 {entry} →",
+                    "callback_data": (
+                        f"nav:codex:{entry_rel}"
+                        if agent is AgentKind.CODEX else f"nav:{entry_rel}"
+                    ),
+                },
             ])
             continue
         elif is_proj:
-            row.append({"text": f"📂 {entry}", "callback_data": f"start:{entry_rel}"})
+            row.append({
+                "text": f"📂 {entry}",
+                "callback_data": project_callback_data(agent, entry_rel),
+            })
         elif has_nested:
-            row.append({"text": f"📁 {entry} →", "callback_data": f"nav:{entry_rel}"})
+            row.append({
+                "text": f"📁 {entry} →",
+                "callback_data": (
+                    f"nav:codex:{entry_rel}"
+                    if agent is AgentKind.CODEX else f"nav:{entry_rel}"
+                ),
+            })
         else:
             continue
 
@@ -635,12 +693,12 @@ def _folder_keyboard(rel_path=""):
     return keyboard
 
 
-def _project_keyboard():
+def _project_keyboard(agent=AgentKind.CLAUDE):
     """Инлайн-клавиатура с проектами (гибрид: проекты + drill-down)."""
-    return _folder_keyboard("")
+    return _folder_keyboard("", agent=agent)
 
 
-def handle_projects(msg):
+def handle_projects(msg, agent=AgentKind.CLAUDE):
     """Список проектов с инлайн-кнопками."""
     user_msg_id = msg.get("message_id")
     topic_id = get_msg_topic(msg)
@@ -649,13 +707,13 @@ def handle_projects(msg):
         tg_send("📁 ~/projects не найдена", topic_id=topic_id, reply_to=user_msg_id)
         return
 
-    keyboard = _project_keyboard()
+    keyboard = _project_keyboard(agent=agent)
     if not keyboard:
         tg_send("📁 Нет проектов в ~/projects", topic_id=topic_id, reply_to=user_msg_id)
         return
 
     tg_send(
-        "📁 Выбери проект:",
+        f"📁 Выбери проект для {'Codex' if agent is AgentKind.CODEX else 'Claude Code'}:",
         topic_id=topic_id,
         reply_to=user_msg_id,
         reply_markup={"inline_keyboard": keyboard},
@@ -663,7 +721,7 @@ def handle_projects(msg):
 
 
 def handle_sessions(msg):
-    """Показывает активные tmux-сессии с Claude Code."""
+    """Показывает активные tmux-сессии Claude Code и Codex."""
     user_msg_id = msg.get("message_id")
     topic_id = get_msg_topic(msg)
     result = subprocess.run(
@@ -679,11 +737,12 @@ def handle_sessions(msg):
         parts = line.split(maxsplit=1)
         name = parts[0]
         path = os.path.basename(parts[1]) if len(parts) > 1 else ""
-        if name.startswith("claude-"):
-            lines.append(f"▸ <code>{name}</code> — {path}")
+        if is_managed_session(name):
+            label = "Codex" if name.startswith("codex-") else "Claude Code"
+            lines.append(f"▸ {label}: <code>{name}</code> — {path}")
 
     if len(lines) == 1:
-        lines.append("Нет сессий Claude Code")
+        lines.append("Нет сессий Claude Code или Codex")
 
     tg_send(
         "\n".join(lines),
@@ -694,7 +753,7 @@ def handle_sessions(msg):
 
 
 def close_session(session_name):
-    """Gracefully close a Claude Code tmux session + закрыть Forum Topic."""
+    """Gracefully close an agent tmux session and its Forum Topic."""
     result = subprocess.run(
         ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_id}"],
         capture_output=True, text=True,
@@ -789,14 +848,18 @@ def handle_close(msg):
         parts = line.split(maxsplit=1)
         name = parts[0]
         path = os.path.basename(parts[1]) if len(parts) > 1 else ""
-        if name.startswith("claude-"):
+        if is_managed_session(name):
             keyboard.append([{
                 "text": f"❌ {name} — {path}",
                 "callback_data": f"close:{name}",
             }])
 
     if not keyboard:
-        tg_send("📋 Нет активных сессий Claude Code", topic_id=topic_id, reply_to=user_msg_id)
+        tg_send(
+            "📋 Нет активных сессий Claude Code или Codex",
+            topic_id=topic_id,
+            reply_to=user_msg_id,
+        )
         return
 
     if len(keyboard) > 1:
@@ -1216,7 +1279,13 @@ def handle_callback(callback_query):
         tg_edit(chat_msg_id, f"{original_text}\n\n{label}")
         logger.info(f"[Callback] {label} -> pane {pane_id}")
     elif data.startswith("start:"):
-        project = data[6:]
+        payload = data[6:]
+        if payload.startswith("codex:"):
+            agent = AgentKind.CODEX
+            project = payload[6:]
+        else:
+            agent = AgentKind.CLAUDE
+            project = payload
         # Защита от path traversal
         if ".." in project and project not in ("__home__", "__projects__"):
             tg_api("answerCallbackQuery", {
@@ -1230,9 +1299,16 @@ def handle_callback(callback_query):
             "callback_query_id": cb_id,
             "text": f"Запускаю {label}...",
         })
-        handle_newstart(msg, f"/newstart {project}")
+        agent_arg = "codex " if agent is AgentKind.CODEX else ""
+        handle_newstart(msg, f"/newstart {agent_arg}{project}")
     elif data.startswith("nav:"):
-        rel_path = data[4:]  # может быть "" для корня
+        payload = data[4:]
+        if payload.startswith("codex:"):
+            agent = AgentKind.CODEX
+            rel_path = payload[6:]
+        else:
+            agent = AgentKind.CLAUDE
+            rel_path = payload
         if ".." in rel_path:
             tg_api("answerCallbackQuery", {
                 "callback_query_id": cb_id,
@@ -1243,7 +1319,7 @@ def handle_callback(callback_query):
         tg_api("answerCallbackQuery", {"callback_query_id": cb_id})
         chat_msg_id = msg.get("message_id")
 
-        keyboard = _folder_keyboard(rel_path)
+        keyboard = _folder_keyboard(rel_path, agent=agent)
         folder_name = os.path.basename(rel_path) if rel_path else "проекты"
         tg_edit(
             chat_msg_id,
@@ -1266,7 +1342,7 @@ def handle_callback(callback_query):
             closed = []
             if result.returncode == 0:
                 for name in result.stdout.strip().split("\n"):
-                    if name.startswith("claude-"):
+                    if is_managed_session(name):
                         close_session(name)
                         closed.append(name)
             text = f"🔴 Закрыто сессий: {len(closed)}" if closed else "Нет сессий для закрытия"

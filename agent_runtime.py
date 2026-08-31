@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import os
 import re
 
 
@@ -33,6 +34,33 @@ def parse_newstart_args(text: str) -> tuple[AgentKind, str | None]:
         return AgentKind.CODEX, project
     project = " ".join(args).strip() or None
     return AgentKind.CLAUDE, project
+
+
+def make_session_name(agent: AgentKind, timestamp: int) -> str:
+    return f"{agent.value}-{timestamp}"
+
+
+def is_managed_session(session_name: str) -> bool:
+    return session_name.startswith(("claude-", "codex-"))
+
+
+def project_callback_data(agent: AgentKind, project: str) -> str:
+    if agent is AgentKind.CODEX:
+        return f"start:codex:{project}"
+    return f"start:{project}"
+
+
+def resolve_project_dir(project: str, projects_root: str, home_dir: str) -> str:
+    if project == "__home__":
+        return os.path.realpath(home_dir)
+    if project == "__projects__":
+        return os.path.realpath(projects_root)
+
+    root = os.path.realpath(projects_root)
+    candidate = os.path.realpath(os.path.join(root, project))
+    if os.path.commonpath((root, candidate)) != root:
+        raise ValueError("project path escapes projects root")
+    return candidate
 
 
 def build_launch_argv(spec: LaunchSpec) -> list[str]:
