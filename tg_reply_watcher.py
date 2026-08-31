@@ -1632,6 +1632,8 @@ def main():
     # Регистрируем команды бота (для меню в группе и в приватном чате)
     commands = json.dumps([
         {"command": "newstart", "description": "🚀 Новая сессия Claude или Codex"},
+        {"command": "newcodex", "description": "🤖 Запустить Codex"},
+        {"command": "newclaude", "description": "🟠 Запустить Claude Code"},
         {"command": "projects", "description": "📁 Список проектов"},
         {"command": "sessions", "description": "📋 Активные сессии"},
         {"command": "close", "description": "🔴 Закрыть сессию"},
@@ -1688,7 +1690,8 @@ def main():
             # Команды бота — убираем @bot_username суффикс (в группах: /cmd@botname args)
             raw_text = msg.get("text", "").strip()
             cmd_text = re.sub(r"^(/\w+)@\w+", r"\1", raw_text)
-            if cmd_text.startswith("/newstart"):
+            command = cmd_text.split(maxsplit=1)[0]
+            if command in ("/newstart", "/newcodex", "/newclaude"):
                 try:
                     handle_newstart(msg, cmd_text)
                 except Exception as e:

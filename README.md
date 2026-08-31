@@ -130,6 +130,8 @@ python3 -u ~/.claude/tg-integration/tg_reply_watcher.py
 |---------|----------|
 | `/newstart [проект]` | Запустить Claude Code в новой tmux-сессии |
 | `/newstart codex [проект]` | Запустить Codex CLI в новой tmux-сессии |
+| `/newcodex [проект]` | Быстрая команда запуска Codex; без проекта открывает picker |
+| `/newclaude [проект]` | Быстрая команда запуска Claude; без проекта открывает picker |
 | `/projects` | Выбрать проект из ~/projects |
 | `/sessions` | Список активных сессий |
 | `/close` | Закрыть сессию (в топике — закрывает сессию и удаляет топик) |

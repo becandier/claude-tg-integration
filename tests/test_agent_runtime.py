@@ -34,6 +34,18 @@ class ParseNewStartArgsTests(unittest.TestCase):
             (AgentKind.CODEX, None),
         )
 
+    def test_newcodex_alias_selects_codex(self):
+        self.assertEqual(
+            parse_newstart_args("/newcodex mobile"),
+            (AgentKind.CODEX, "mobile"),
+        )
+
+    def test_newclaude_alias_selects_claude(self):
+        self.assertEqual(
+            parse_newstart_args("/newclaude mobile"),
+            (AgentKind.CLAUDE, "mobile"),
+        )
+
 
 class BuildLaunchArgvTests(unittest.TestCase):
     def test_builds_claude_launch_without_shell(self):

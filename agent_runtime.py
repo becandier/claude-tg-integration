@@ -38,7 +38,14 @@ _CODEX_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 def parse_newstart_args(text: str) -> tuple[AgentKind, str | None]:
     parts = text.strip().split()
+    command = parts[0].split("@", 1)[0].lower() if parts else ""
     args = parts[1:]
+    if command == "/newcodex":
+        project = " ".join(args).strip() or None
+        return AgentKind.CODEX, project
+    if command == "/newclaude":
+        project = " ".join(args).strip() or None
+        return AgentKind.CLAUDE, project
     if args and args[0].lower() == AgentKind.CODEX.value:
         project = " ".join(args[1:]).strip() or None
         return AgentKind.CODEX, project
