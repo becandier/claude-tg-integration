@@ -1,26 +1,28 @@
-# Claude Code Telegram Integration
+# Claude Code + Codex Telegram Integration
 
-Двусторонний мост между Telegram и [Claude Code](https://docs.anthropic.com/en/docs/claude-code) через tmux-сессии. Управляй Claude Code с телефона — отправляй задачи, получай результаты, подтверждай действия.
+Двусторонний мост между Telegram, Claude Code и Codex CLI через tmux-сессии. Управляй обоими coding-агентами с телефона: запускай проекты, отправляй задачи, файлы и голосовые сообщения, переключай модели и reasoning effort.
 
 ## Возможности
 
 - **Forum Topics** — каждая сессия в отдельном топике, удобная навигация между проектами
-- **Мульти-сессии** — несколько Claude Code сессий параллельно, каждая в своём tmux pane
-- **Фото и документы** — отправляй скриншоты, PDF, файлы кода — Claude увидит их содержимое
-- **Файлы от Claude** — Claude может прислать файл (до 50 МБ) прямо в топик через `tg_send_file.sh`
+- **Два агента** — Claude Code по умолчанию и Codex CLI по команде `/newstart codex`
+- **Мульти-сессии** — несколько Claude/Codex-сессий параллельно, каждая в своём tmux pane
+- **Фото и документы** — отправляй скриншоты, PDF и файлы кода прямо агенту
+- **Файлы от агента** — файл до 50 МБ можно прислать в топик через `tg_send_file.sh`
 - **Голосовой ввод** — голосовые сообщения распознаются офлайн через Whisper
-- **Permission prompts** — инлайн-кнопки ✅/❌ для подтверждения действий Claude
+- **Permission prompts Claude** — инлайн-кнопки ✅/❌ для подтверждений Claude
 - **Навигация по проектам** — drill-down браузер с инлайн-кнопками
-- **Мониторинг активности** — уведомления если Claude работает долго или завис
+- **Мониторинг активности** — уведомления, если Claude или Codex работает долго или завис
 - **Форматирование** — Markdown → HTML: код, таблицы, bold/italic
 - **Терминал** — автоматически открывает iTerm2/Terminal.app с tmux attach
 
 ## Как работает
 
 ```
-Telegram (Forum Topic) ──→ tg_reply_watcher.py ──tmux send-keys──→ Claude Code (tmux pane)
-Telegram (Forum Topic) ←── tg_stop_hook.sh ←───── stop hook ←──── Claude Code завершил
-Telegram (Forum Topic) ←── tg_notify_hook.sh ←─── notify hook ←── Claude Code ждёт ввода
+Telegram (Forum Topic) ──→ tg_reply_watcher.py ──tmux send-keys──→ Claude/Codex
+Telegram (Forum Topic) ←── tg_stop_hook.sh ←───── Claude Stop hook
+Telegram (Forum Topic) ←── tg_notify_hook.sh ←─── Claude Notification hook
+Telegram (Forum Topic) ←── tg_codex_notify_hook.py ← Codex turn-complete notify
 ```
 
 Каждая сессия живёт в отдельном Forum Topic — навигация между проектами в один тап.
@@ -70,6 +72,17 @@ mkdir -p whisper-models
 # Скачать модель: https://huggingface.co/ggerganov/whisper.cpp/tree/main
 ```
 
+Установи и авторизуй нужные CLI:
+
+```bash
+claude --version
+codex --version
+```
+
+Codex-сессии запускаются с `--dangerously-bypass-approvals-and-sandbox` и `--dangerously-bypass-hook-trust`. Это режим полного локального доступа без Telegram approval-кнопок. Используй его только на доверенной машине и в доверенных проектах.
+
+Для каждой Codex-сессии watcher передаёт временный `notify` override, поэтому глобальный `~/.codex/config.toml` менять не требуется. После завершения turn Codex отправляет `last_assistant_message` через общий Telegram formatter в топик своей tmux-сессии.
+
 ### 5. Хуки Claude Code
 
 В `~/.claude/settings.json` добавить:
@@ -116,30 +129,32 @@ python3 -u ~/.claude/tg-integration/tg_reply_watcher.py
 | Команда | Описание |
 |---------|----------|
 | `/newstart [проект]` | Запустить Claude Code в новой tmux-сессии |
+| `/newstart codex [проект]` | Запустить Codex CLI в новой tmux-сессии |
 | `/projects` | Выбрать проект из ~/projects |
 | `/sessions` | Список активных сессий |
 | `/close` | Закрыть сессию (в топике — закрывает сессию и удаляет топик) |
 | `/cleanup` | Очистить все скачанные медиафайлы |
-| `/effort [уровень]` | Эффорт reasoning сессии (low…ultracode), с инлайн-кнопками |
-| `/model [алиас]` | Модель сессии; список берётся из живого пикера `/model` Claude Code, активная помечена |
+| `/effort [уровень]` | Reasoning effort активного агента; список зависит от Claude/Codex |
+| `/model [алиас]` | Модель активного агента; список читается из живого `/model` picker |
 
 ## Использование
 
-1. Отправь `/newstart my-project` или выбери проект через `/projects`
-2. Бот создаст **Forum Topic** и запустит Claude Code в tmux
-3. Пиши прямо в топике — текст автоматически уходит в Claude (reply не нужен)
-4. Отправляй фото и документы — Claude получит путь к файлу и сможет прочитать содержимое
-5. Кнопки ✅/❌ появляются когда Claude спрашивает разрешение
-6. Короткие ответы (`да`, `y`, `ok`) автоматически подтверждают permission prompts
-7. Если Claude работает дольше 2 минут — придёт уведомление "⏳ всё ещё работает"
-8. `/close` в топике — закрывает сессию и удаляет топик
+1. Отправь `/newstart my-project` для Claude или `/newstart codex my-project` для Codex
+2. Без имени проекта бот покажет project picker и сохранит выбранный тип агента
+3. Бот создаст **Forum Topic** и запустит агента в tmux
+4. Пиши прямо в топике — текст автоматически уходит в нужную сессию (reply не нужен)
+5. Отправляй фото и документы — агент получит путь к файлу
+6. Кнопки ✅/❌ появляются только для permission prompts Claude; Codex работает в Full Access
+7. Короткие ответы (`да`, `y`, `ok`) подтверждают только permission prompts Claude
+8. Если агент работает дольше 2 минут — придёт уведомление "⏳ всё ещё работает"
+9. `/close` в топике — закрывает сессию и удаляет топик
 
 Голосовые сообщения распознаются и отправляются как текст.
 Медиафайлы хранятся в `/tmp/claude_tg_media/` и автоматически удаляются при закрытии сессии.
 
-## Отправка файлов из Claude
+## Отправка файлов из сессии
 
-Claude (или ты вручную) может отправить файл в Telegram:
+Claude, Codex или ты вручную можете отправить файл в Telegram:
 
 ```bash
 ~/.claude/tg-integration/tg_send_file.sh <файл> [подпись]

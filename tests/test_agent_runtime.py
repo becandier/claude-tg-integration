@@ -59,6 +59,7 @@ class BuildLaunchArgvTests(unittest.TestCase):
             project_dir="/tmp/project",
             model="gpt-5.6-sol",
             effort="high",
+            notify_command=("python3", "/tmp/tg_codex_notify_hook.py"),
         )
 
         self.assertEqual(
@@ -70,6 +71,7 @@ class BuildLaunchArgvTests(unittest.TestCase):
                 "--dangerously-bypass-hook-trust",
                 "--no-alt-screen", "-m", "gpt-5.6-sol",
                 "-c", 'model_reasoning_effort="high"',
+                "-c", 'notify=["python3","/tmp/tg_codex_notify_hook.py"]',
             ],
         )
 

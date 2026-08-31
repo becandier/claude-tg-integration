@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared helper для управления маппингом сессий Claude Code <-> Telegram.
+Shared helper для управления маппингом сессий Claude/Codex <-> Telegram.
 Атомарная запись + file locking. Используется хуками и watcher-ом.
 
 Структура JSON:

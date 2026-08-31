@@ -1,5 +1,5 @@
 #!/bin/bash
-# Единый конфиг Telegram-интеграции Claude Code
+# Единый конфиг Telegram-интеграции Claude Code и Codex CLI
 TG_BOT_TOKEN="YOUR_BOT_TOKEN"
 # ID супергруппы с Forum Topics (отрицательное число, например -1001234567890)
 TG_CHAT_ID="YOUR_SUPERGROUP_ID"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Reply Watcher for Claude Code (multi-session)
+Telegram Reply Watcher for Claude Code and Codex CLI (multi-session)
 
 Поллит Telegram на reply-сообщения. По message_id определяет,
 в какой tmux pane отправить текст.
@@ -434,6 +434,30 @@ def wait_and_trust_folder(pane_id, timeout=15):
     return False
 
 
+def wait_and_trust_codex_folder(pane_id, timeout=15):
+    """Подтверждает только точный directory-trust prompt Codex CLI."""
+    for _ in range(timeout * 5):
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-25"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        content = result.stdout
+        if (
+            "Do you trust the contents of this directory?" in content
+            and "1. Yes, continue" in content
+            and "2. No, quit" in content
+        ):
+            subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+            logger.info(f"[Trust] Auto-confirmed Codex directory for pane {pane_id}")
+            return True
+        time.sleep(0.2)
+    logger.info(f"[Trust] No Codex directory prompt for pane {pane_id}")
+    return False
+
+
 def write_pid():
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
@@ -481,7 +505,7 @@ def handle_newstart(msg, text):
         )
         return
 
-    session_name = make_session_name(agent, int(time.time()))
+    session_name = make_session_name(agent, time.time_ns())
     project_name = os.path.basename(project_dir)
     agent_name = "Claude Code" if agent is AgentKind.CLAUDE else "Codex"
 
@@ -497,6 +521,10 @@ def handle_newstart(msg, text):
         agent=agent,
         session_name=session_name,
         project_dir=project_dir,
+        notify_command=(
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), "tg_codex_notify_hook.py"),
+        ) if agent is AgentKind.CODEX else (),
     )
     result = subprocess.run(
         build_launch_argv(launch_spec),
@@ -528,10 +556,14 @@ def handle_newstart(msg, text):
     tg_sessions.save_agent(pane_id, agent.value)
 
     # Автоматически подтверждаем trust-промпт в фоне (не блокируя polling)
-    if agent is AgentKind.CLAUDE:
-        threading.Thread(
-            target=wait_and_trust_folder, args=(pane_id,), daemon=True
-        ).start()
+    trust_target = (
+        wait_and_trust_folder
+        if agent is AgentKind.CLAUDE
+        else wait_and_trust_codex_folder
+    )
+    threading.Thread(
+        target=trust_target, args=(pane_id,), daemon=True
+    ).start()
 
     response = tg_send(
         f"🚀 {agent_name} запущен\nПроект: {project_name}\nСессия: {session_name}",
@@ -1348,6 +1380,7 @@ def check_dead_panes():
             clear_pane_waiting(pane_id)
             continue
 
+        snapshot = _capture_pane_content(pane_id)
         if snapshot != activity["last_snapshot"]:
             activity["last_snapshot"] = snapshot
             activity["last_change"] = now
@@ -1356,13 +1389,21 @@ def check_dead_panes():
             continue
 
         idle_time = now - activity["last_change"]
+        agent_name = (
+            "Codex"
+            if tg_sessions.get_agent(pane_id) == AgentKind.CODEX.value
+            else "Claude"
+        )
 
         if idle_time >= ACTIVITY_STUCK_TIMEOUT and not activity["notified_stuck"]:
-            tg_send("⚠️ Claude не отвечает уже 5 минут — возможно завис", topic_id=topic_id)
+            tg_send(
+                f"⚠️ {agent_name} не отвечает уже 5 минут — возможно завис",
+                topic_id=topic_id,
+            )
             activity["notified_stuck"] = True
             logger.info(f"[Activity] pane {pane_id} stuck ({idle_time:.0f}s)")
         elif idle_time >= ACTIVITY_WORKING_TIMEOUT and not activity["notified_working"]:
-            tg_send("⏳ Claude всё ещё работает...", topic_id=topic_id)
+            tg_send(f"⏳ {agent_name} всё ещё работает...", topic_id=topic_id)
             activity["notified_working"] = True
             logger.info(f"[Activity] pane {pane_id} still working ({idle_time:.0f}s)")
 

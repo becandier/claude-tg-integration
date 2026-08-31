@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import json
 import os
 import re
 
@@ -19,6 +20,7 @@ class LaunchSpec:
     project_dir: str
     model: str = ""
     effort: str = ""
+    notify_command: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,4 +181,13 @@ def build_launch_argv(spec: LaunchSpec) -> list[str]:
         codex_argv += ["-m", spec.model]
     if spec.effort:
         codex_argv += ["-c", f'model_reasoning_effort="{spec.effort}"']
+    if spec.notify_command:
+        if any(not value or "\x00" in value for value in spec.notify_command):
+            raise ValueError("invalid notify command")
+        notify_toml = json.dumps(
+            list(spec.notify_command),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        codex_argv += ["-c", f"notify={notify_toml}"]
     return argv + codex_argv
