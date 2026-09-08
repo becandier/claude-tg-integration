@@ -132,6 +132,17 @@ if [ -z "$SUMMARY" ]; then
     exit 0
 fi
 
+# Codex может вызвать и native Stop hook, и legacy notify для одного turn.
+# Атомарный marker гарантирует ровно одну доставку; payload без turn_id пропускаем.
+DEDUPE_MARKER=$(printf '%s' "$INPUT" | python3 "$HOME/.claude/tg-integration/tg_hook_dedupe.py" claim 2>/dev/null)
+DEDUPE_STATUS=$?
+if [ "$DEDUPE_STATUS" = "3" ]; then
+    exit 0
+fi
+if [ "$DEDUPE_STATUS" != "0" ]; then
+    DEDUPE_MARKER=""
+fi
+
 ESC_PROJECT=$(printf '%s' "$PROJECT" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
 if [ -n "$TMUX" ]; then
     ICON="✅"
@@ -292,6 +303,10 @@ except Exception:
 done
 
 rm -f "$CHUNKS_FILE"
+
+if [ -z "$FIRST_MSG_ID" ] && [ -n "$DEDUPE_MARKER" ]; then
+    python3 "$HOME/.claude/tg-integration/tg_hook_dedupe.py" release "$DEDUPE_MARKER" >/dev/null 2>&1
+fi
 
 if [ -n "$TMUX" ] && [ -n "$PANE_ID" ] && [ -n "$FIRST_MSG_ID" ]; then
     python3 "$HELPER" save_route "$FIRST_MSG_ID" "$PANE_ID" 2>/dev/null

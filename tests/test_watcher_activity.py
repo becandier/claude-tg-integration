@@ -68,5 +68,112 @@ class CodexDirectoryTrustTests(unittest.TestCase):
         )
 
 
+class ClaudeDirectoryTrustTests(unittest.TestCase):
+    def test_confirms_when_yes_is_already_selected(self):
+        content = (
+            "Accessing workspace:\n\n"
+            "❯ Yes, I trust this folder\n"
+            "  No, exit\n\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+
+        self.assertEqual(
+            watcher.claude_trust_navigation_keys(content),
+            ("Enter",),
+        )
+
+    def test_does_not_accept_unrelated_confirmation(self):
+        content = "Delete all files?\n❯ Yes\n  No\nEnter to confirm"
+
+        self.assertIsNone(watcher.claude_trust_navigation_keys(content))
+
+    @patch.object(watcher.time, "sleep")
+    @patch.object(watcher.subprocess, "run")
+    def test_moves_from_no_to_yes_before_confirming(self, run, _sleep):
+        run.side_effect = [
+            Mock(
+                returncode=0,
+                stdout=(
+                    "Accessing workspace:\n\n"
+                    "❯ No, exit\n"
+                    "  Yes, I trust this folder\n\n"
+                    "Enter to confirm · Esc to cancel\n"
+                ),
+            ),
+            Mock(returncode=0, stdout=""),
+            Mock(returncode=0, stdout=""),
+        ]
+
+        self.assertTrue(watcher.wait_and_trust_folder("%1", timeout=1))
+
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["tmux", "send-keys", "-t", "%1", "Down"],
+        )
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            ["tmux", "send-keys", "-t", "%1", "Enter"],
+        )
+
+
+class BotCommandParsingTests(unittest.TestCase):
+    def test_video_only_message_has_no_command(self):
+        command_text, command = watcher.parse_bot_command("")
+
+        self.assertEqual(command_text, "")
+        self.assertEqual(command, "")
+
+    def test_group_command_strips_bot_username(self):
+        command_text, command = watcher.parse_bot_command(
+            "/newcodex@my_bot project"
+        )
+
+        self.assertEqual(command_text, "/newcodex project")
+        self.assertEqual(command, "/newcodex")
+
+
+class CodexInputTests(unittest.TestCase):
+    def test_codex_launch_relies_on_native_stop_hook_only(self):
+        spec = watcher.make_launch_spec(
+            watcher.AgentKind.CODEX,
+            "codex-123",
+            "/tmp/project",
+        )
+
+        self.assertEqual(spec.notify_command, ())
+
+    @patch.object(watcher.time, "time_ns", return_value=123)
+    @patch.object(watcher.os, "getpid", return_value=456)
+    @patch.object(watcher, "pane_exists", return_value=True)
+    @patch.object(watcher.subprocess, "run")
+    def test_uses_bracketed_paste_before_enter(
+        self,
+        run,
+        _pane_exists,
+        _getpid,
+        _time_ns,
+    ):
+        run.return_value = Mock(returncode=0)
+
+        self.assertTrue(watcher.tmux_send_codex("%1", "line one\nline two"))
+
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            ["tmux", "load-buffer", "-b", "tg-codex-456-123", "-"],
+        )
+        self.assertEqual(run.call_args_list[0].kwargs["input"], "line one\nline two")
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            [
+                "tmux", "paste-buffer", "-p", "-r", "-d",
+                "-b", "tg-codex-456-123", "-t", "%1",
+            ],
+        )
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            ["tmux", "send-keys", "-t", "%1", "Enter"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

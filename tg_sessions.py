@@ -156,6 +156,52 @@ def get_agent(pane_id):
     return data.get("pane_to_agent", {}).get(pane_id, "claude")
 
 
+def save_project(pane_id, project):
+    def _do(data):
+        data.setdefault("pane_to_project", {})[pane_id] = project
+    _with_lock(_do)
+
+
+def save_topic_name(pane_id, name):
+    def _do(data):
+        if pane_id in data.get("pane_to_topic", {}):
+            data.setdefault("pane_to_topic_name", {})[pane_id] = name
+    _with_lock(_do)
+
+
+def save_startup(pane_id, state):
+    def _do(data):
+        mapping = data.setdefault("pane_to_startup", {})
+        if state is None:
+            mapping.pop(pane_id, None)
+        else:
+            mapping[pane_id] = state
+    _with_lock(_do)
+
+
+def queue_message(pane_id, text, message_id):
+    def _do(data):
+        pending = data.setdefault("pane_to_pending", {}).setdefault(pane_id, [])
+        if not any(item["message_id"] == message_id for item in pending):
+            pending.append({"text": text, "message_id": message_id})
+    _with_lock(_do)
+
+
+def pending_messages(pane_id):
+    return _load().get("pane_to_pending", {}).get(pane_id, [])
+
+
+def ack_message(pane_id, message_id):
+    def _do(data):
+        mapping = data.setdefault("pane_to_pending", {})
+        remaining = [item for item in mapping.get(pane_id, []) if item["message_id"] != message_id]
+        if remaining:
+            mapping[pane_id] = remaining
+        else:
+            mapping.pop(pane_id, None)
+    _with_lock(_do)
+
+
 def cleanup_pane(pane_id):
     def _do(data):
         data["msg_to_pane"] = {
@@ -166,6 +212,11 @@ def cleanup_pane(pane_id):
         data.get("pane_to_effort", {}).pop(pane_id, None)
         data.get("pane_to_model", {}).pop(pane_id, None)
         data.get("pane_to_agent", {}).pop(pane_id, None)
+        data.get("pane_to_startup", {}).pop(pane_id, None)
+        data.get("pane_to_pending", {}).pop(pane_id, None)
+        data.get("pane_to_title", {}).pop(pane_id, None)
+        data.get("pane_to_project", {}).pop(pane_id, None)
+        data.get("pane_to_topic_name", {}).pop(pane_id, None)
     _with_lock(_do)
 
 

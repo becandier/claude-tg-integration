@@ -35,3 +35,17 @@ class SessionAgentPersistenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PendingMessageTests(SessionAgentPersistenceTests):
+    def test_queue_survives_reload_and_deduplicates_telegram_retry(self):
+        tg_sessions.queue_message('%1', 'hello', 7)
+        tg_sessions.queue_message('%1', 'hello', 7)
+        self.assertEqual(tg_sessions.pending_messages('%1'), [{'text': 'hello', 'message_id': 7}])
+        tg_sessions.ack_message('%1', 7)
+        self.assertEqual(tg_sessions.pending_messages('%1'), [])
+
+    def test_startup_is_persisted_and_cleaned(self):
+        tg_sessions.save_startup('%1', {'project': 'demo'})
+        self.assertEqual(tg_sessions._load()['pane_to_startup']['%1']['project'], 'demo')
+        tg_sessions.cleanup_pane('%1')
+        self.assertNotIn('%1', tg_sessions._load()['pane_to_startup'])

@@ -91,6 +91,63 @@ def _picker_line(line: str) -> tuple[str, bool] | None:
     return match.group(1), selected
 
 
+def terminal_model(output: str, agent: AgentKind) -> str:
+    """Read the live footer first; the Codex welcome header can be stale."""
+    if agent is AgentKind.CODEX:
+        for line in reversed(output.splitlines()):
+            match = re.match(r"\s*((?:gpt-|codex-|o\d)[\w.:/-]+)\s+.*·", line)
+            if match:
+                return match.group(1)
+        match = re.search(r"model:\s+([\w.:/-]+)", output)
+        return match.group(1) if match else ""
+    for line in output.splitlines():
+        match = re.search(r"\b((?:Opus|Sonnet|Haiku|Fable)\s+[\d.]+(?:\s*\([^)]*\))?)(?:\s+with\s+\w+\s+effort)?\s*·", line)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def terminal_effort(output: str, agent: AgentKind) -> str:
+    if agent is AgentKind.CODEX:
+        for line in reversed(output.splitlines()):
+            match = re.match(r"\s*(?:gpt-|codex-|o\d)[\w.:/-]+\s+(\w+)\s*·", line)
+            if match:
+                return match.group(1)
+    else:
+        match = re.search(r"\bwith\s+(\w+)\s+effort\s*·", output)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def terminal_ready(output: str, agent: AgentKind) -> bool:
+    """Require a composer, never mistake a menu cursor for one."""
+    marker = "›" if agent is AgentKind.CODEX else "❯"
+    cursors = [line.strip() for line in output.splitlines() if line.lstrip().startswith(marker)]
+    if not cursors or re.match(r"[›❯]\s*\d+\.", cursors[-1]):
+        return False
+    tail = output[output.rfind(cursors[-1]):]
+    recent = "\n".join([line for line in output.splitlines() if line.strip()][-6:])
+    if re.search(r"esc to interrupt|Working \(|esc to cancel", recent, re.I):
+        return False
+    if agent is AgentKind.CODEX:
+        return bool(terminal_model(tail, agent))
+    return True
+
+
+def parse_codex_update_picker(output: str) -> list[PickerOption]:
+    if not re.search(r"update available", output, re.I):
+        return []
+    options = []
+    for line in output.splitlines():
+        match = re.match(r"\s*(›\s*)?(\d+)\.\s+(.+)", line)
+        if match:
+            options.append(PickerOption(match.group(2), match.group(3).strip(), bool(match.group(1))))
+    if not any(option.label.lower().startswith("update") for option in options):
+        return []
+    return options
+
+
 def parse_codex_model_picker(output: str) -> list[PickerOption]:
     options = []
     for line in output.splitlines():

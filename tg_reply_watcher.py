@@ -10,6 +10,7 @@ Telegram Reply Watcher for Claude Code and Codex CLI (multi-session)
 """
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -71,6 +72,7 @@ MEDIA_DIR = "/tmp/claude_tg_media"
 # Импортируем shared-модуль
 sys.path.insert(0, os.path.expanduser("~/.claude/tg-integration"))
 import tg_sessions
+from tg_topic_title import format_topic_name
 from agent_runtime import (
     AgentKind,
     LaunchSpec,
@@ -83,6 +85,10 @@ from agent_runtime import (
     picker_navigation_keys,
     project_callback_data,
     resolve_project_dir,
+    terminal_model,
+    terminal_effort,
+    terminal_ready,
+    parse_codex_update_picker,
 )
 
 logger = logging.getLogger("watcher")
@@ -167,6 +173,13 @@ def tg_edit(message_id, text, parse_mode=None, reply_markup=None):
 def get_msg_topic(msg):
     """Извлекает message_thread_id из входящего сообщения (если из топика)."""
     return msg.get("message_thread_id")
+
+
+def parse_bot_command(raw_text):
+    """Нормализует Telegram-команду; media-only updates возвращают пустую команду."""
+    command_text = re.sub(r"^(/\w+)@\w+", r"\1", raw_text.strip())
+    parts = command_text.split(maxsplit=1)
+    return command_text, parts[0] if parts else ""
 
 
 def tg_react(message_id, emoji="\u26a1"):
@@ -382,12 +395,53 @@ def tmux_send(pane_id, text):
     return True
 
 
+def tmux_send_codex(pane_id, text):
+    """Отправляет Codex единый bracketed-paste event, затем отдельный Enter."""
+    if not pane_exists(pane_id):
+        return False
+
+    buffer_name = f"tg-codex-{os.getpid()}-{time.time_ns()}"
+    loaded = subprocess.run(
+        ["tmux", "load-buffer", "-b", buffer_name, "-"],
+        input=text,
+        text=True,
+        capture_output=True,
+    )
+    if loaded.returncode != 0:
+        return False
+
+    pasted = subprocess.run(
+        [
+            "tmux", "paste-buffer", "-p", "-r", "-d",
+            "-b", buffer_name, "-t", pane_id,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if pasted.returncode != 0:
+        subprocess.run(
+            ["tmux", "delete-buffer", "-b", buffer_name],
+            capture_output=True,
+            text=True,
+        )
+        return False
+
+    submitted = subprocess.run(
+        ["tmux", "send-keys", "-t", pane_id, "Enter"],
+        capture_output=True,
+        text=True,
+    )
+    return submitted.returncode == 0
+
+
 def tmux_send_keys(pane_id, *keys):
     """Отправляет raw-клавиши (не литеральный текст) в tmux pane."""
     if not pane_exists(pane_id):
         return False
     for key in keys:
-        subprocess.run(["tmux", "send-keys", "-t", pane_id, key])
+        result = subprocess.run(["tmux", "send-keys", "-t", pane_id, key], capture_output=True)
+        if result.returncode != 0:
+            return False
     return True
 
 
@@ -414,6 +468,49 @@ def is_permission_prompt(pane_id):
     return False
 
 
+def claude_trust_navigation_keys(content):
+    """Возвращает клавиши для выбора Yes только в directory trust dialog."""
+    if (
+        "Accessing workspace:" not in content
+        or "Yes, I trust this folder" not in content
+        or "Enter to confirm" not in content
+    ):
+        return None
+
+    options = [
+        line
+        for line in content.splitlines()
+        if "Yes, I trust this folder" in line
+        or "No, exit" in line
+        or "No, continue without these permissions" in line
+    ]
+    selected_index = next(
+        (
+            index
+            for index, line in enumerate(options)
+            if line.lstrip().startswith(("❯", "›", ">"))
+        ),
+        None,
+    )
+    yes_index = next(
+        (
+            index
+            for index, line in enumerate(options)
+            if "Yes, I trust this folder" in line
+        ),
+        None,
+    )
+    if selected_index is None or yes_index is None:
+        return None
+    if selected_index == yes_index:
+        return ("Enter",)
+
+    direction = "Down" if yes_index > selected_index else "Up"
+    return tuple(
+        [direction] * abs(yes_index - selected_index) + ["Enter"]
+    )
+
+
 def wait_and_trust_folder(pane_id, timeout=15):
     """Ждёт появления trust-промпта Claude Code и автоматически подтверждает."""
     for _ in range(timeout * 5):
@@ -424,9 +521,11 @@ def wait_and_trust_folder(pane_id, timeout=15):
         if result.returncode != 0:
             return False
         content = result.stdout
-        if "Yes, I trust this folder" in content or "Enter to confirm" in content:
+        keys = claude_trust_navigation_keys(content)
+        if keys:
             time.sleep(0.3)
-            subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+            for key in keys:
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, key])
             logger.info(f"[Trust] Auto-confirmed trust prompt for pane {pane_id}")
             return True
         time.sleep(0.2)
@@ -473,6 +572,15 @@ def cleanup_pid(*_):
 
 # ── Команды бота ──────────────────────────────────────────────
 
+def make_launch_spec(agent, session_name, project_dir):
+    """Создаёт launch spec; Telegram-доставка Codex идёт через native Stop hook."""
+    return LaunchSpec(
+        agent=agent,
+        session_name=session_name,
+        project_dir=project_dir,
+    )
+
+
 def handle_newstart(msg, text):
     """Создаёт новую tmux-сессию с Claude Code или Codex CLI."""
     agent, project = parse_newstart_args(text)
@@ -517,15 +625,7 @@ def handle_newstart(msg, text):
         tg_send("❌ Не удалось создать топик", topic_id=src_topic, reply_to=user_msg_id)
         return
 
-    launch_spec = LaunchSpec(
-        agent=agent,
-        session_name=session_name,
-        project_dir=project_dir,
-        notify_command=(
-            sys.executable,
-            os.path.join(os.path.dirname(__file__), "tg_codex_notify_hook.py"),
-        ) if agent is AgentKind.CODEX else (),
-    )
+    launch_spec = make_launch_spec(agent, session_name, project_dir)
     result = subprocess.run(
         build_launch_argv(launch_spec),
         capture_output=True, text=True,
@@ -554,21 +654,17 @@ def handle_newstart(msg, text):
     # Сохраняем маппинг pane → topic
     tg_sessions.save_topic(pane_id, topic_id)
     tg_sessions.save_agent(pane_id, agent.value)
-
-    # Автоматически подтверждаем trust-промпт в фоне (не блокируя polling)
-    trust_target = (
-        wait_and_trust_folder
-        if agent is AgentKind.CLAUDE
-        else wait_and_trust_codex_folder
-    )
-    threading.Thread(
-        target=trust_target, args=(pane_id,), daemon=True
-    ).start()
+    tg_sessions.save_project(pane_id, project_dir)
 
     response = tg_send(
-        f"🚀 {agent_name} запущен\nПроект: {project_name}\nСессия: {session_name}",
+        f"⏳ {agent_name} запускается\nПроект: {project_name}\nСессия: {session_name}\nМодель: определяется после запуска",
         topic_id=topic_id,
     )
+    tg_sessions.save_startup(pane_id, {
+        "session": session_name, "project": project_dir,
+        "started_at": time.time(),
+        "message_id": response.get("result", {}).get("message_id"),
+    })
 
     if response.get("ok"):
         bot_msg_id = str(response["result"]["message_id"])
@@ -1008,7 +1104,7 @@ def handle_effort(msg, text):
     arg = parts[1].strip().lower() if len(parts) > 1 else ""
 
     if not arg:
-        cur = tg_sessions.get_effort(pane_id)
+        cur = _current_effort(pane_id, agent)
         tg_send(
             _effort_text(cur, agent),
             topic_id=topic_id, parse_mode="Markdown",
@@ -1058,6 +1154,159 @@ def _capture_pane(pane_id):
     return result.stdout if result.returncode == 0 else ""
 
 
+_startup_notices = {}
+
+
+def sync_topic_titles():
+    data = tg_sessions._load()
+    for pane_id, title in data.get("pane_to_title", {}).items():
+        topic_id = data.get("pane_to_topic", {}).get(pane_id)
+        if not topic_id:
+            continue
+        project = data.get("pane_to_project", {}).get(pane_id)
+        if not project:
+            result = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", pane_id, "#{session_path}"],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                continue
+            project = result.stdout.strip()
+            tg_sessions.save_project(pane_id, project)
+        name = format_topic_name(
+            data.get("pane_to_agent", {}).get(pane_id, "claude"),
+            os.path.basename(project.rstrip("/")) or project, title,
+        )
+        if name == data.get("pane_to_topic_name", {}).get(pane_id):
+            continue
+        response = tg_api("editForumTopic", {
+            "chat_id": CHAT_ID, "message_thread_id": topic_id, "name": name,
+        })
+        if response.get("ok") or "TOPIC_NOT_MODIFIED" in response.get("description", ""):
+            tg_sessions.save_topic_name(pane_id, name)
+        else:
+            logger.warning("[TopicTitle] Failed to rename topic %s", topic_id)
+
+
+def _update_fingerprint(options):
+    return hashlib.sha256(json.dumps(
+        [(o.value, o.label) for o in options], ensure_ascii=False,
+    ).encode()).hexdigest()[:12]
+
+
+def queue_if_blocked(pane_id, text, message_id, topic_id):
+    """Return True only when text may be delivered now; persist it otherwise."""
+    state = tg_sessions._load()
+    agent = AgentKind(tg_sessions.get_agent(pane_id))
+    starting = pane_id in state.get("pane_to_startup", {})
+    queued = bool(state.get("pane_to_pending", {}).get(pane_id))
+    if not starting and not queued:
+        if agent is AgentKind.CLAUDE or terminal_ready(_capture_pane(pane_id), agent):
+            return True
+    tg_sessions.queue_message(pane_id, text, message_id)
+    tg_send("⏳ Сообщение сохранено. Отправлю, когда чат будет готов к вводу.", topic_id=topic_id)
+    return False
+
+
+def check_starting_sessions():
+    """Poll startup and drain durable queues in the main thread, without input races."""
+    data = tg_sessions._load()
+    starting = data.get("pane_to_startup", {})
+    pending = data.get("pane_to_pending", {})
+    for pane_id in set(starting) | set(pending):
+        if not pane_exists(pane_id):
+            continue
+        state = starting.get(pane_id)
+        agent = AgentKind(tg_sessions.get_agent(pane_id))
+        topic_id = tg_sessions.get_topic(pane_id)
+        output = _capture_pane(pane_id)
+        if state and state.get("updating"):
+            result = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_dead} #{pane_dead_status}"],
+                capture_output=True, text=True,
+            )
+            if result.stdout.strip().startswith("1 ") and not state.get("restart_failed"):
+                if result.stdout.strip() != "1 0":
+                    tg_send("⚠️ Обновление завершилось с ошибкой. Запускаю установленную версию Codex; сообщения сохранены.", topic_id=topic_id)
+                argv = build_launch_argv(make_launch_spec(agent, state["session"], state["project"]))[7:]
+                restarted = subprocess.run(
+                    ["tmux", "respawn-pane", "-t", pane_id, "-c", state["project"], *argv],
+                    capture_output=True, text=True,
+                )
+                if restarted.returncode == 0:
+                    subprocess.run(["tmux", "set-option", "-p", "-t", pane_id, "remain-on-exit", "off"], capture_output=True)
+                    state.pop("updating", None)
+                    state["started_at"] = time.time()
+                    tg_sessions.save_startup(pane_id, state)
+                else:
+                    state["restart_failed"] = True
+                    tg_sessions.save_startup(pane_id, state)
+                    tg_send("⚠️ Не удалось перезапустить Codex после обновления. Сообщения сохранены; проверь терминал.\n" + restarted.stderr[-1000:], topic_id=topic_id)
+                continue
+        if state:
+            keys = claude_trust_navigation_keys(output) if agent is AgentKind.CLAUDE else None
+            if agent is AgentKind.CODEX and (
+                "Do you trust the contents of this directory?" in output
+                and "› 1. Yes, continue" in output and "2. No, quit" in output
+            ):
+                keys = ("Enter",)
+            if keys:
+                tmux_send_keys(pane_id, *keys)
+                continue
+        if terminal_ready(output, agent):
+            _startup_notices.pop(pane_id, None)
+            if state:
+                model = terminal_model(output, agent)
+                if not model and agent is AgentKind.CLAUDE:
+                    models = probe_models(pane_id, agent) or []
+                    model = next((m["label"] for m in models if m["current"]), "")
+                if model:
+                    tg_sessions.save_model(pane_id, model)
+                effort = terminal_effort(output, agent)
+                if effort:
+                    tg_sessions.save_effort(pane_id, effort)
+                label = "Codex" if agent is AgentKind.CODEX else "Claude Code"
+                text = (f"🚀 {label} готов\nПроект: {os.path.basename(state['project'])}"
+                        f"\nСессия: {state['session']}\nМодель: {model or 'не удалось определить'}"
+                        f"\nEffort: {effort or 'не удалось определить'}")
+                response = (tg_edit(state["message_id"], text) if state.get("message_id")
+                            else tg_send(text, topic_id=topic_id))
+                tg_sessions.save_startup(pane_id, None)
+                if not response.get("ok"):
+                    tg_send(text, topic_id=topic_id)
+            messages = tg_sessions.pending_messages(pane_id)
+            if messages:
+                item = messages[0]
+                send = tmux_send_codex if agent is AgentKind.CODEX else tmux_send
+                if send(pane_id, item["text"]):
+                    tg_sessions.save_reply_to(pane_id, item["message_id"])
+                    tg_sessions.ack_message(pane_id, item["message_id"])
+                    tg_react(item["message_id"])
+                    mark_pane_waiting(pane_id)
+            continue
+        options = parse_codex_update_picker(output) if agent is AgentKind.CODEX else []
+        if options:
+            fingerprint = _update_fingerprint(options)
+            if _startup_notices.get(pane_id) != fingerprint:
+                response = tg_send(
+                    "⬆️ Codex предлагает обновление. Выбери действие; сообщения подождут в очереди.",
+                    topic_id=topic_id,
+                    reply_markup={"inline_keyboard": [[{
+                        "text": option.label[:60],
+                        "callback_data": f"startup:{fingerprint}:{option.value}",
+                    }] for option in options]},
+                )
+                if response.get("ok"):
+                    _startup_notices[pane_id] = fingerprint
+        elif state and time.time() - state["started_at"] > 15 and pane_id not in _startup_notices:
+            response = tg_send(
+                "⏳ CLI ещё не готов. Если в терминале открыт диалог, заверши его там; сообщения сохранены.\n\n"
+                + output.strip()[-1800:], topic_id=topic_id,
+            )
+            if response.get("ok"):
+                _startup_notices[pane_id] = "waiting"
+
+
 def _input_line(pane_id):
     """Нижняя строка ввода Claude (`❯`) или Codex (`›`)."""
     lines = [
@@ -1095,7 +1344,19 @@ def _wait_for_picker(pane_id, marker, timeout=3.0):
 
 
 def _open_codex_model_picker(pane_id):
-    if not pane_exists(pane_id) or not _type_command(pane_id, "/model"):
+    if not pane_exists(pane_id):
+        return ""
+    output = _capture_pane(pane_id)
+    # Recover menus left open by a timeout or an unavailable effort.
+    for _ in range(3):
+        if "Select Model and Effort" in output and parse_codex_model_picker(output):
+            return output
+        if "Select Reasoning Level" not in output and "Advanced Reasoning" not in output:
+            break
+        tmux_send_keys(pane_id, "Escape")
+        time.sleep(0.2)
+        output = _capture_pane(pane_id)
+    if not terminal_ready(output, AgentKind.CODEX) or not _type_command(pane_id, "/model"):
         return ""
     return _wait_for_picker(pane_id, "Select Model and Effort")
 
@@ -1106,10 +1367,9 @@ def _choose_picker_option(pane_id, options, target):
     except ValueError:
         subprocess.run(["tmux", "send-keys", "-t", pane_id, "Escape"])
         return False
-    if keys:
-        tmux_send_keys(pane_id, *keys)
-    tmux_send_keys(pane_id, "Enter")
-    return True
+    if keys and not tmux_send_keys(pane_id, *keys):
+        return False
+    return tmux_send_keys(pane_id, "Enter")
 
 
 def _choose_codex_effort_from_open_picker(pane_id, level):
@@ -1132,10 +1392,14 @@ def _choose_codex_effort_from_open_picker(pane_id, level):
 def _set_codex_effort(pane_id, level):
     output = _open_codex_model_picker(pane_id)
     models = parse_codex_model_picker(output)
-    current = next((option for option in models if option.selected), None)
+    current = next((option for option in models if option.current), None)
     if current is None or not _choose_picker_option(pane_id, models, current.value):
         return False
-    return _choose_codex_effort_from_open_picker(pane_id, level)
+    try:
+        return (_choose_codex_effort_from_open_picker(pane_id, level)
+                and _finish_codex_selection(pane_id, current.value, level))
+    finally:
+        _close_codex_picker(pane_id)
 
 
 def _probe_codex_models(pane_id):
@@ -1205,9 +1469,16 @@ def _model_keyboard(models, current):
     return rows
 
 
-def _model_text(current):
+def _current_effort(pane_id, agent):
+    effort = terminal_effort(_capture_pane(pane_id), agent)
+    if effort:
+        tg_sessions.save_effort(pane_id, effort)
+    return effort or tg_sessions.get_effort(pane_id)
+
+
+def _model_text(current, effort=""):
     if current:
-        return f"🤖 Модель сессии: *{current}*"
+        return f"🤖 Модель сессии: *{current}*\n⚙️ Effort: *{effort or 'не определён'}*"
     return "🤖 Выбери модель для этой сессии:"
 
 
@@ -1216,16 +1487,45 @@ def _set_codex_model(pane_id, alias):
     models = parse_codex_model_picker(output)
     if not models or not _choose_picker_option(pane_id, models, alias):
         return False
-    effort = tg_sessions.get_effort(pane_id)
-    if effort in CODEX_EFFORT_LEVELS:
-        return _choose_codex_effort_from_open_picker(pane_id, effort)
-    reasoning_output = _wait_for_picker(pane_id, "Select Reasoning Level")
-    reasoning_options = parse_codex_effort_picker(reasoning_output)
-    current = next((option for option in reasoning_options if option.selected), None)
-    return bool(
-        current
-        and _choose_picker_option(pane_id, reasoning_options, current.value)
-    )
+    try:
+        effort = tg_sessions.get_effort(pane_id)
+        reasoning_output = _wait_for_picker(pane_id, "Select Reasoning Level")
+        reasoning_options = parse_codex_effort_picker(reasoning_output)
+        if not reasoning_options:
+            return _finish_codex_selection(pane_id, alias)
+        available = {option.value for option in reasoning_options}
+        if effort in available or (effort in ("max", "ultra") and "more" in available):
+            chosen = _choose_codex_effort_from_open_picker(pane_id, effort)
+        else:
+            current = next((option for option in reasoning_options if option.selected), None)
+            chosen = bool(current and _choose_picker_option(pane_id, reasoning_options, current.value))
+        return chosen and _finish_codex_selection(pane_id, alias)
+    finally:
+        _close_codex_picker(pane_id)
+
+
+def _finish_codex_selection(pane_id, model, effort=None, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        output = _capture_pane(pane_id)
+        if terminal_ready(output, AgentKind.CODEX) and terminal_model(output, AgentKind.CODEX) == model:
+            actual_effort = terminal_effort(output, AgentKind.CODEX)
+            if effort is None or actual_effort == effort:
+                if actual_effort:
+                    tg_sessions.save_effort(pane_id, actual_effort)
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def _close_codex_picker(pane_id):
+    for _ in range(3):
+        output = _capture_pane(pane_id)
+        if not any(marker in output for marker in ("Select Model and Effort", "Select Reasoning Level", "Advanced Reasoning")):
+            return
+        if not tmux_send_keys(pane_id, "Escape"):
+            return
+        time.sleep(0.2)
 
 
 def set_session_model(pane_id, alias, agent=AgentKind.CLAUDE):
@@ -1261,6 +1561,7 @@ def handle_model(msg, text):
     arg = parts[1].strip().lower() if len(parts) > 1 else ""
 
     if not arg:
+        effort = _current_effort(pane_id, agent)
         models = probe_models(pane_id, agent)
         note = ""
         if models is None:
@@ -1282,9 +1583,9 @@ def handle_model(msg, text):
         if current:
             tg_sessions.save_model(pane_id, current)
         tg_send(
-            _model_text(current) + note,
+            _model_text(current, effort) + note,
             topic_id=topic_id, parse_mode="Markdown",
-            reply_markup={"inline_keyboard": _model_keyboard(models, current)},
+            reply_markup={"inline_keyboard": _model_keyboard(models, current) + _effort_keyboard(effort, agent)},
         )
         return
 
@@ -1295,7 +1596,9 @@ def handle_model(msg, text):
         tg_send("⚠️ Не удалось изменить модель в активной сессии", topic_id=topic_id)
         return
     tg_sessions.save_model(pane_id, arg)
-    tg_send(_model_text(arg), topic_id=topic_id, parse_mode="Markdown")
+    effort = _current_effort(pane_id, agent)
+    tg_send(_model_text(arg, effort), topic_id=topic_id, parse_mode="Markdown",
+            reply_markup={"inline_keyboard": _effort_keyboard(effort, agent)})
 
 
 _last_pane_check = 0.0
@@ -1413,6 +1716,35 @@ def handle_callback(callback_query):
     cb_id = callback_query.get("id")
     data = callback_query.get("data", "")
     msg = callback_query.get("message", {})
+
+    if data.startswith("startup:"):
+        parts = data.split(":")
+        topic_id = get_msg_topic(msg)
+        pane_id = tg_sessions.get_pane_by_topic(topic_id) if topic_id else ""
+        options = (parse_codex_update_picker(_capture_pane(pane_id))
+                   if pane_id and tg_sessions.get_agent(pane_id) == AgentKind.CODEX.value else [])
+        if len(parts) != 3 or not options or _update_fingerprint(options) != parts[1]:
+            tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Кнопка устарела: диалог уже изменился", "show_alert": True})
+            return
+        option = next((o for o in options if o.value == parts[2]), None)
+        if option is None:
+            return
+        if option.label.lower().startswith("update"):
+            state = tg_sessions._load().get("pane_to_startup", {}).get(pane_id)
+            if state is None:
+                tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Обнови эту сессию в терминале; сообщения сохранены", "show_alert": True})
+                return
+            result = subprocess.run(["tmux", "set-option", "-p", "-t", pane_id, "remain-on-exit", "on"], capture_output=True)
+            if result.returncode != 0:
+                return
+            state["updating"] = True
+            tg_sessions.save_startup(pane_id, state)
+        chosen = _choose_picker_option(pane_id, options, option.value)
+        tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Выбрано: " + option.label if chosen else "Не удалось выбрать действие"})
+        if chosen:
+            tg_edit(msg.get("message_id"), "⏳ " + option.label, reply_markup={"inline_keyboard": []})
+            _startup_notices.pop(pane_id, None)
+        return
 
     if data.startswith("approve:") or data.startswith("reject:"):
         pane_id = data.split(":", 1)[1]
@@ -1562,11 +1894,16 @@ def handle_callback(callback_query):
             "callback_query_id": cb_id,
             "text": f"Эффорт: {level}",
         })
+        model = terminal_model(_capture_pane(pane_id), agent) or tg_sessions.get_model(pane_id)
+        model_rows = [
+            [button for button in row if button.get("callback_data", "").startswith("model:")]
+            for row in (msg.get("reply_markup") or {}).get("inline_keyboard", [])
+        ]
         tg_edit(
             chat_msg_id,
-            _effort_text(level, agent),
+            _model_text(model, level) if model else _effort_text(level, agent),
             parse_mode="Markdown",
-            reply_markup={"inline_keyboard": _effort_keyboard(level, agent)},
+            reply_markup={"inline_keyboard": [row for row in model_rows if row] + _effort_keyboard(level, agent)},
         )
         logger.info(f"[Callback] effort={level} -> pane {pane_id}")
     elif data.startswith("model:"):
@@ -1592,9 +1929,10 @@ def handle_callback(callback_query):
             })
             return
         tg_sessions.save_model(pane_id, alias)
+        effort = _current_effort(pane_id, agent)
         tg_api("answerCallbackQuery", {
             "callback_query_id": cb_id,
-            "text": f"Модель: {alias}",
+            "text": f"Модель: {alias} · {effort or 'effort не определён'}",
         })
         # Клавиатуру не перестраиваем с нуля — двигаем галочку в существующей
         kb = (msg.get("reply_markup") or {}).get("inline_keyboard") or []
@@ -1606,16 +1944,19 @@ def handle_callback(callback_query):
                 if base.startswith("✅ "):
                     base = base[len("✅ "):]
                 cb_data = btn.get("callback_data", "")
+                if not cb_data.startswith("model:"):
+                    continue
                 new_row.append({
                     "text": ("✅ " + base) if cb_data == data else base,
                     "callback_data": cb_data,
                 })
-            new_kb.append(new_row)
+            if new_row:
+                new_kb.append(new_row)
         tg_edit(
             chat_msg_id,
-            _model_text(alias),
+            _model_text(alias, effort),
             parse_mode="Markdown",
-            reply_markup={"inline_keyboard": new_kb},
+            reply_markup={"inline_keyboard": new_kb + _effort_keyboard(effort, agent)},
         )
         logger.info(f"[Callback] model={alias} -> pane {pane_id}")
     else:
@@ -1650,10 +1991,17 @@ def main():
     backoff = 5
 
     while True:
+        try:
+            check_starting_sessions()
+            sync_topic_titles()
+        except Exception:
+            logger.exception("[Startup] Cannot process startup or pending messages")
+        session_data = tg_sessions._load()
+        waiting = bool(session_data.get("pane_to_startup") or session_data.get("pane_to_pending"))
         offset = get_offset()
         data = tg_api("getUpdates", {
             "offset": offset,
-            "timeout": 30,
+            "timeout": 2 if waiting else 30,
             "allowed_updates": json.dumps(["message", "callback_query"]),
         })
 
@@ -1688,9 +2036,7 @@ def main():
                 continue
 
             # Команды бота — убираем @bot_username суффикс (в группах: /cmd@botname args)
-            raw_text = msg.get("text", "").strip()
-            cmd_text = re.sub(r"^(/\w+)@\w+", r"\1", raw_text)
-            command = cmd_text.split(maxsplit=1)[0]
+            cmd_text, command = parse_bot_command(msg.get("text", ""))
             if command in ("/newstart", "/newcodex", "/newclaude"):
                 try:
                     handle_newstart(msg, cmd_text)
@@ -1815,9 +2161,20 @@ def main():
                 text = (
                     f"[TG | ~/.claude/tg-integration] {text}\n\n"
                     "[SYSTEM] Сообщение из Telegram — примени скилл tg-chat."
+                    " В начале содержательного обсуждения выбери краткое название темы (3–6 слов, на языке пользователя)"
+                    " и выполни: python3 ~/.claude/tg-integration/tg_topic_title.py 'Название темы'."
+                    " Это разрешённое переименование текущего Telegram-топика; подтверждение не требуется."
+                    " При существенной смене темы обнови название той же командой;"
+                    " не меняй его для каждого ответа и не включай секреты или личные данные."
                 )
+                if not queue_if_blocked(pane_id, text, user_msg_id, topic_id):
+                    continue
                 logger.info(f"Reply: {text[:80]} -> pane {pane_id}")
-                sent = tmux_send(pane_id, text)
+                sent = (
+                    tmux_send(pane_id, text)
+                    if is_claude
+                    else tmux_send_codex(pane_id, text)
+                )
 
             if sent:
                 tg_sessions.save_reply_to(pane_id, user_msg_id)
@@ -1825,9 +2182,13 @@ def main():
                 mark_pane_waiting(pane_id)
                 logger.info("  OK")
             else:
-                cleanup_media(pane_id)
-                tg_sessions.cleanup_pane(pane_id)
-                logger.info(f"  Pane {pane_id} not found, cleaned up")
+                if pane_exists(pane_id):
+                    tg_sessions.queue_message(pane_id, text, user_msg_id)
+                    tg_send("⏳ Не удалось передать сообщение. Оно сохранено для повторной отправки.", topic_id=topic_id)
+                else:
+                    tg_send("⚠️ Сессия завершилась. Сообщение не отправлено — создай новый чат и повтори его.", topic_id=topic_id)
+                    cleanup_media(pane_id)
+                    tg_sessions.cleanup_pane(pane_id)
 
         if new_offset > offset:
             save_offset(new_offset)
