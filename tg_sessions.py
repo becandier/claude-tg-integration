@@ -145,6 +145,22 @@ def get_model(pane_id):
     return data.get("pane_to_model", {}).get(pane_id, "")
 
 
+def save_session_id(pane_id, session_id):
+    """Id сессии CLI (Codex thread / Claude session) — для чтения журналов."""
+    def _do(data):
+        mapping = data.setdefault("pane_to_session_id", {})
+        if session_id:
+            mapping[pane_id] = session_id
+        else:
+            mapping.pop(pane_id, None)
+    _with_lock(_do)
+
+
+def get_session_id(pane_id):
+    data = _load()
+    return data.get("pane_to_session_id", {}).get(pane_id, "")
+
+
 def save_agent(pane_id, agent):
     def _do(data):
         data.setdefault("pane_to_agent", {})[pane_id] = agent
@@ -212,6 +228,7 @@ def cleanup_pane(pane_id):
         data.get("pane_to_effort", {}).pop(pane_id, None)
         data.get("pane_to_model", {}).pop(pane_id, None)
         data.get("pane_to_agent", {}).pop(pane_id, None)
+        data.get("pane_to_session_id", {}).pop(pane_id, None)
         data.get("pane_to_startup", {}).pop(pane_id, None)
         data.get("pane_to_pending", {}).pop(pane_id, None)
         data.get("pane_to_title", {}).pop(pane_id, None)

@@ -3,9 +3,20 @@
 
 import argparse
 import os
+import re
 import unicodedata
 
 import tg_sessions
+
+# /model сохраняет алиас, который ввёл человек; в названии топика он должен
+# выглядеть так же, как в CLI. Codex-модели (`gpt-5.6-sol`) уже читаемы.
+_MODEL_ALIASES = {
+    "opus": "Opus",
+    "sonnet": "Sonnet",
+    "haiku": "Haiku",
+    "fable": "Fable",
+    "default": "",
+}
 
 
 def _clean(text):
@@ -19,12 +30,36 @@ def _truncate(text, units):
     return text.encode("utf-16-le")[:units * 2].decode("utf-16-le", errors="ignore")
 
 
-def format_topic_name(agent, project, title):
-    label = "Codex" if agent == "codex" else "Claude Code"
-    project = _truncate(_clean(project), 40)
-    prefix = f"🚀 {label} · {project} · "
+def model_label(model):
+    """Короткое имя модели для названия топика: `Opus 5 (1M context)` → `Opus 5`.
+
+    Пустая строка означает, что модель ещё не определена и нужен запасной
+    ярлык по типу агента.
+    """
+    name = _clean(re.sub(r"\s*\([^)]*\)", "", model or ""))
+    if not name:
+        return ""
+    if name.islower() and " " not in name:
+        return _MODEL_ALIASES.get(name, name)
+    return _truncate(name, 30)
+
+
+def format_topic_name(agent, project, title, model=""):
+    """`🚀 Opus 5 · projects · Тема обсуждения` — модель вместо типа агента.
+
+    Пустые части опускаются вместе с разделителем: у старых сессий проект или
+    тема могут быть ещё не известны.
+    """
+    label = model_label(model) or ("Codex" if agent == "codex" else "Claude Code")
+    prefix = "🚀 " + " · ".join(
+        part for part in (label, _truncate(_clean(project), 40)) if part
+    )
+    title = _clean(title)
+    if not title:
+        return _truncate(prefix, 128)
+    prefix += " · "
     remaining = 128 - len(prefix.encode("utf-16-le")) // 2
-    return prefix + _truncate(_clean(title), remaining)
+    return prefix + _truncate(title, remaining)
 
 
 def set_title(pane_id, title):

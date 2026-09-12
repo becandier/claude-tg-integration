@@ -21,6 +21,8 @@ import shutil
 import tempfile
 import threading
 import time
+import mimetypes
+import urllib.error
 import urllib.parse
 import urllib.request
 from logging.handlers import RotatingFileHandler
@@ -68,10 +70,22 @@ _FS_CACHE_TTL = 30.0
 _is_project_cache = {}      # path -> (expires_at, bool)
 _nested_cache = {}          # (path, depth) -> (expires_at, bool)
 MEDIA_DIR = "/tmp/claude_tg_media"
+# Bot API отдаёт через getFile файлы не больше 20 МБ (лимит на стороне Telegram).
+TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+# Виды медиа, которые мост принимает. Порядок важен: document проверяем последним,
+# т.к. Telegram кладёт в document только то, что не распознал как video/audio/animation.
+MEDIA_KINDS = (
+    ("video", "Видео", ".mp4"),
+    ("animation", "GIF", ".mp4"),
+    ("video_note", "Видеокружок", ".mp4"),
+    ("audio", "Аудио", ".mp3"),
+    ("document", None, ".bin"),
+)
 
 # Импортируем shared-модуль
 sys.path.insert(0, os.path.expanduser("~/.claude/tg-integration"))
 import tg_sessions
+import tg_stats
 from tg_topic_title import format_topic_name
 from agent_runtime import (
     AgentKind,
@@ -116,6 +130,25 @@ def tg_api(method, params=None):
             timeout = 35 if method == "getUpdates" else 10
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                body = ""
+            logger.error(f"[TG API] {method} (attempt {attempt + 1}/{max_attempts}): {e} {body[:200]}")
+            # 4xx детерминирован, а в теле лежит description, по которому вызов
+            # отличает «уже так и называется» от настоящей ошибки — возвращаем его.
+            if 400 <= e.code < 500:
+                try:
+                    payload = json.loads(body)
+                except (json.JSONDecodeError, ValueError):
+                    payload = None
+                if isinstance(payload, dict) and "ok" in payload:
+                    return payload
+                return {"ok": False, "description": body}
+            if attempt < max_attempts - 1:
+                time.sleep(1)
+            continue
         except Exception as e:
             logger.error(f"[TG API] {method} (attempt {attempt + 1}/{max_attempts}): {e}")
             if attempt < max_attempts - 1:
@@ -214,6 +247,33 @@ def _safe_pane_id(pane_id):
 
 def media_dir_for_pane(pane_id):
     return os.path.join(MEDIA_DIR, _safe_pane_id(pane_id))
+
+
+def safe_media_name(name, fallback):
+    """Приводит имя файла из Telegram к безопасному для ФС виду."""
+    name = os.path.basename((name or "").strip())
+    name = re.sub(r"[^\w.\-]+", "_", name, flags=re.UNICODE).strip("._")
+    return name or fallback
+
+
+def extract_media(msg, msg_id):
+    """Ищет любое поддерживаемое медиа в сообщении.
+
+    Возвращает (file_id, filename, file_size, label) или (None, None, None, None).
+    """
+    photo = msg.get("photo")
+    if photo:
+        best = photo[-1]
+        return best["file_id"], f"photo_{msg_id}.jpg", best.get("file_size"), "Фото"
+
+    for kind, label, default_ext in MEDIA_KINDS:
+        item = msg.get(kind)
+        if not isinstance(item, dict) or "file_id" not in item:
+            continue
+        ext = mimetypes.guess_extension(item.get("mime_type") or "") or default_ext
+        filename = safe_media_name(item.get("file_name"), f"{kind}_{msg_id}{ext}")
+        return item["file_id"], filename, item.get("file_size"), label or filename
+    return None, None, None, None
 
 
 def download_media(file_id, pane_id, filename):
@@ -619,8 +679,9 @@ def handle_newstart(msg, text):
 
     tg_react(user_msg_id, "⚡")
 
-    # Создаём Forum Topic для этой сессии
-    topic_id = create_forum_topic(f"🚀 {agent_name} · {project_name}")
+    # Создаём Forum Topic для этой сессии. Модель ещё неизвестна — пока в
+    # названии тип агента, sync_topic_titles заменит его, когда CLI запустится.
+    topic_id = create_forum_topic(format_topic_name(agent.value, project_name, ""))
     if not topic_id:
         tg_send("❌ Не удалось создать топик", topic_id=src_topic, reply_to=user_msg_id)
         return
@@ -1158,11 +1219,17 @@ _startup_notices = {}
 
 
 def sync_topic_titles():
+    """Держит названия топиков в актуальном виде: модель, проект, тема.
+
+    Идём по всем топикам, а не только по тем, где агент уже выбрал название:
+    модель становится известна при старте сессии и меняется через `/model`,
+    и название топика должно это догонять.
+    """
     data = tg_sessions._load()
-    for pane_id, title in data.get("pane_to_title", {}).items():
-        topic_id = data.get("pane_to_topic", {}).get(pane_id)
+    for pane_id, topic_id in data.get("pane_to_topic", {}).items():
         if not topic_id:
             continue
+        title = data.get("pane_to_title", {}).get(pane_id, "")
         project = data.get("pane_to_project", {}).get(pane_id)
         if not project:
             result = subprocess.run(
@@ -1176,8 +1243,13 @@ def sync_topic_titles():
         name = format_topic_name(
             data.get("pane_to_agent", {}).get(pane_id, "claude"),
             os.path.basename(project.rstrip("/")) or project, title,
+            data.get("pane_to_model", {}).get(pane_id, ""),
         )
+        # Имя не изменилось — выходим до обращений к tmux и Telegram: цикл
+        # watcher-а прокручивается раз в пару секунд, пока сессия стартует.
         if name == data.get("pane_to_topic_name", {}).get(pane_id):
+            continue
+        if not pane_exists(pane_id):
             continue
         response = tg_api("editForumTopic", {
             "chat_id": CHAT_ID, "message_thread_id": topic_id, "name": name,
@@ -1601,6 +1673,176 @@ def handle_model(msg, text):
             reply_markup={"inline_keyboard": _effort_keyboard(effort, agent)})
 
 
+# Один кадр /usage вмещает не все окна лимитов в узком терминале, поэтому
+# оверлей прокручивается и кадры накапливаются (парсер схлопывает повторы).
+STATS_SCROLL_PAGES = 6
+STATS_SCROLL_STEP = ("Down",) * 8
+# Шапка оверлея /usage: она закреплена сверху при любой ширине терминала,
+# тогда как блоки лимитов в узком окне уходят ниже кадра.
+CLAUDE_USAGE_OVERLAY_RE = re.compile(r"Settings\s+Status\s+Config\s+Usage\s+Stats")
+# Конец блока /context. Его шапку с "38.5k/1m tokens" узкий терминал выталкивает
+# за кадр, поэтому ждать появления именно её нельзя.
+CLAUDE_CONTEXT_TAIL_RE = re.compile(r"Auto-compact window:|/context all to expand")
+CODEX_STATUS_RE = re.compile(re.escape(tg_stats.CODEX_STATUS_MARKER))
+
+
+def _wait_for_render(pane_id, pattern, before, timeout=8.0):
+    """Ждёт, пока вывод команды отрисуется и экран перестанет меняться.
+
+    Ориентироваться на первое появление маркера нельзя: вывод предыдущего
+    `/context` или `/status` ещё виден, и проверка проходит до перерисовки.
+    """
+    started = time.time()
+    deadline = started + timeout
+    previous = None
+    while time.time() < deadline:
+        output = _capture_pane(pane_id)
+        if output != before and pattern.search(output):
+            # Обычно ждём остановки перерисовки, но анимация в футере может
+            # никогда не дать двух одинаковых кадров — тогда берём последний.
+            if output == previous or time.time() - started > timeout / 2:
+                return output
+        previous = output
+        time.sleep(0.35)
+    return ""
+
+
+def _collect_usage_screen(pane_id, first_page):
+    """Снимает оверлей /usage целиком, прокручивая его вниз.
+
+    Down-клавиши безопасны только внутри оверлея: на обычном композере они
+    листают историю сообщений и оставляют мусор в строке ввода.
+    """
+    pages = [first_page]
+    for _ in range(STATS_SCROLL_PAGES):
+        if not CLAUDE_USAGE_OVERLAY_RE.search(pages[-1]):
+            break
+        if not tmux_send_keys(pane_id, *STATS_SCROLL_STEP):
+            break
+        time.sleep(0.45)
+        page = _capture_pane(pane_id)
+        if page == pages[-1]:
+            break
+        pages.append(page)
+    return "\n".join(pages)
+
+
+def _close_claude_overlay(pane_id):
+    """Закрывает оверлей /usage. Второй Escape шлём только если он ещё открыт:
+    на пустом композере двойной Escape открывает выбор точки возврата."""
+    for _ in range(2):
+        if not CLAUDE_USAGE_OVERLAY_RE.search(_capture_pane(pane_id)):
+            return
+        tmux_send_keys(pane_id, "Escape")
+        time.sleep(0.4)
+
+
+def _claude_transcript_context(pane_id, window):
+    """Фолбэк по контексту: точные токены последнего запроса из транскрипта."""
+    record = tg_stats.find_claude_session(pane_id)
+    if not record:
+        return None
+    session_id = record.get("sessionId") or ""
+    if session_id:
+        tg_sessions.save_session_id(pane_id, session_id)
+    return tg_stats.read_claude_transcript_context(
+        tg_stats.claude_transcript_path(record), window,
+    )
+
+
+def probe_claude_stats(pane_id):
+    """Контекст через `/context`, лимиты плана через `/usage`."""
+    pane = _capture_pane(pane_id)
+    stats = tg_stats.SessionStats(
+        agent=AgentKind.CLAUDE.value,
+        model=terminal_model(pane, AgentKind.CLAUDE),
+        effort=_current_effort(pane_id, AgentKind.CLAUDE),
+    )
+    if not terminal_ready(pane, AgentKind.CLAUDE):
+        stats.context = _claude_transcript_context(
+            pane_id, tg_stats.claude_context_window(pane),
+        )
+        stats.notes.append("Сессия занята — лимиты читаются только в простое")
+        return stats
+
+    window = tg_stats.claude_context_window(pane)
+    if _type_command(pane_id, "/context"):
+        screen = _wait_for_render(pane_id, CLAUDE_CONTEXT_TAIL_RE, pane)
+        stats.context = tg_stats.parse_claude_context(screen)
+        window = tg_stats.parse_claude_autocompact_window(screen) or window
+        stats.model = stats.model or tg_stats.parse_claude_context_model(screen)
+    stats.model = stats.model or tg_sessions.get_model(pane_id)
+    if stats.context is None:
+        # Узкий терминал выталкивает шапку блока за кадр: токены берём из
+        # транскрипта, размер окна — из уцелевшей строки Auto-compact window.
+        stats.context = _claude_transcript_context(pane_id, window)
+    if stats.context is None:
+        stats.notes.append("Контекст не прочитал: в сессии ещё нет ответов модели")
+
+    before = _capture_pane(pane_id)
+    if _type_command(pane_id, "/usage"):
+        screen = _wait_for_render(pane_id, CLAUDE_USAGE_OVERLAY_RE, before)
+        if screen:
+            stats.limits = tg_stats.parse_claude_usage(
+                _collect_usage_screen(pane_id, screen),
+            )
+            _close_claude_overlay(pane_id)
+    if not stats.limits:
+        stats.notes.append("Не смог прочитать экран /usage")
+    return stats
+
+
+def probe_codex_stats(pane_id):
+    """`/status` отдаёт модель, план, контекст и лимиты одним экраном."""
+    pane = _capture_pane(pane_id)
+    stats = None
+    if terminal_ready(pane, AgentKind.CODEX) and _type_command(pane_id, "/status"):
+        screen = _wait_for_render(pane_id, CODEX_STATUS_RE, pane)
+        if screen:
+            stats = tg_stats.parse_codex_status(screen)
+            if stats.session_id:
+                tg_sessions.save_session_id(pane_id, stats.session_id)
+    if stats is None:
+        stats = tg_stats.SessionStats(
+            agent=AgentKind.CODEX.value,
+            model=terminal_model(pane, AgentKind.CODEX),
+            effort=_current_effort(pane_id, AgentKind.CODEX),
+            session_id=tg_sessions.get_session_id(pane_id),
+        )
+        stats.notes.append("Данные из журнала сессии: /status не открылся")
+    if stats.context and stats.limits:
+        return stats
+
+    # Экран занят, обрезан или показал не всё — добираем снимок из rollout-журнала.
+    payload = tg_stats.read_codex_token_count(
+        tg_stats.find_codex_rollout(stats.session_id),
+    )
+    stats.context = stats.context or tg_stats.codex_context_from_payload(payload)
+    stats.limits = stats.limits or tg_stats.codex_limits_from_payload(payload)
+    return stats
+
+
+def handle_stats(msg):
+    """`/stats` — контекст окна и лимиты плана для сессии текущего топика."""
+    user_msg_id = msg.get("message_id")
+    topic_id = get_msg_topic(msg)
+
+    if not topic_id:
+        tg_send("📊 /stats работает только внутри топика сессии", reply_to=user_msg_id)
+        return
+
+    pane_id = tg_sessions.get_pane_by_topic(topic_id)
+    if not pane_id or not pane_exists(pane_id):
+        tg_send("⚠️ Нет активной сессии в этом топике", topic_id=topic_id)
+        return
+
+    agent = AgentKind(tg_sessions.get_agent(pane_id))
+    tg_react(user_msg_id)
+    probe = probe_codex_stats if agent is AgentKind.CODEX else probe_claude_stats
+    stats = probe(pane_id)
+    tg_send(tg_stats.render_stats(stats), topic_id=topic_id, parse_mode="Markdown")
+
+
 _last_pane_check = 0.0
 
 # Мониторинг активности pane'ов
@@ -1971,16 +2213,16 @@ def main():
     init_offset()
 
     # Регистрируем команды бота (для меню в группе и в приватном чате)
+    # Меню Telegram держим коротким: /newstart, /projects, /sessions и /cleanup
+    # из него убраны, но обработчики на месте — команды работают, если набрать
+    # их руками. /close идёт последней, чтобы не жать её по ошибке.
     commands = json.dumps([
-        {"command": "newstart", "description": "🚀 Новая сессия Claude или Codex"},
         {"command": "newcodex", "description": "🤖 Запустить Codex"},
         {"command": "newclaude", "description": "🟠 Запустить Claude Code"},
-        {"command": "projects", "description": "📁 Список проектов"},
-        {"command": "sessions", "description": "📋 Активные сессии"},
-        {"command": "close", "description": "🔴 Закрыть сессию"},
-        {"command": "cleanup", "description": "🧹 Очистить все медиафайлы"},
         {"command": "effort", "description": "⚙️ Эффорт активного агента"},
         {"command": "model", "description": "🤖 Модель активного агента"},
+        {"command": "stats", "description": "📊 Контекст сессии и лимиты плана"},
+        {"command": "close", "description": "🔴 Закрыть сессию"},
     ])
     tg_api("setMyCommands", {"commands": commands})
     tg_api("setMyCommands", {
@@ -2079,12 +2321,18 @@ def main():
                 except Exception as e:
                     logger.error(f"[Model] {e}")
                 continue
+            if command in ("/stats", "/usage"):
+                try:
+                    handle_stats(msg)
+                except Exception as e:
+                    logger.error(f"[Stats] {e}")
+                continue
 
-            # Текст, голосовое, фото или документ
+            # Текст, голосовое или медиа (фото/видео/GIF/кружок/аудио/документ)
             text = msg.get("text", "").strip()
             voice = msg.get("voice")
-            photo = msg.get("photo")
-            document = msg.get("document")
+            user_msg_id = msg.get("message_id")
+            media_file_id, media_name, media_size, media_label = extract_media(msg, user_msg_id)
 
             if not text and voice:
                 file_id = voice.get("file_id")
@@ -2095,15 +2343,12 @@ def main():
                         logger.info("Voice transcription failed, skipping")
                         continue
 
-            # Caption от фото/документа
-            if not text and (photo or document):
+            # Caption от медиа
+            if not text and media_file_id:
                 text = msg.get("caption", "").strip()
 
-            has_media = bool(photo or document)
-            if not text and not has_media:
+            if not text and not media_file_id:
                 continue
-
-            user_msg_id = msg.get("message_id")
 
             # Маршрутизация: топик → pane (приоритет), fallback на reply
             topic_id = get_msg_topic(msg)
@@ -2124,18 +2369,27 @@ def main():
                 continue
 
             # Скачиваем медиафайл если есть
-            media_path = None
-            if photo:
-                file_id = photo[-1]["file_id"]  # самый большой размер
-                media_path = download_media(file_id, pane_id, f"photo_{user_msg_id}.jpg")
-            elif document:
-                file_name = document.get("file_name", f"doc_{user_msg_id}")
-                file_id = document["file_id"]
-                media_path = download_media(file_id, pane_id, file_name)
+            if media_file_id:
+                if media_size and media_size > TG_DOWNLOAD_LIMIT:
+                    media_path = None
+                    media_error = f"{media_size / 1024 / 1024:.0f} МБ, а Bot API отдаёт ботам максимум 20 МБ"
+                else:
+                    media_path = download_media(media_file_id, pane_id, media_name)
+                    media_error = None if media_path else "Telegram не отдал файл (обычно он больше 20 МБ)"
 
-            if media_path:
-                label = "Фото" if photo else os.path.basename(media_path)
-                text = f"[Файл ({label}): {media_path}] {text}" if text else f"[Файл ({label}): {media_path}]"
+                if media_path:
+                    prefix = f"[Файл ({media_label}): {media_path}]"
+                    text = f"{prefix} {text}" if text else prefix
+                else:
+                    logger.warning(f"[Media] {media_label}: {media_error}")
+                    tg_react(user_msg_id, "\U0001f44e")
+                    tg_send(
+                        f"⚠️ Не принял «{media_label}»: {media_error}. "
+                        "Сожми файл, вырежи фрагмент или пришли локальный путь.",
+                        topic_id=topic_id,
+                    )
+                    if not text:
+                        continue
 
             if not text:
                 continue
