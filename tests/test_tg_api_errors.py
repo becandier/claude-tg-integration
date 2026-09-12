@@ -57,6 +57,45 @@ class TgApiHttpErrorTests(unittest.TestCase):
         self.assertEqual(response, {"ok": False})
 
 
+class ReactionTests(unittest.TestCase):
+    """Telegram принимает только свой набор эмодзи: 🎧 отклонялся как невалидный."""
+
+    def test_voice_and_rejected_reactions_are_not_the_invalid_headphones(self):
+        self.assertNotEqual(watcher.REACTION_VOICE, "\U0001f3a7")
+        self.assertEqual(watcher.REACTION_VOICE, "\u270d\ufe0f")
+        self.assertEqual(watcher.REACTION_REJECTED, "\U0001f44e")
+
+    def test_invalid_emoji_falls_back_to_the_known_good_one(self):
+        responses = [
+            {"ok": False, "description": "Bad Request: REACTION_INVALID"},
+            {"ok": True},
+        ]
+        with patch.object(watcher, "tg_api", side_effect=responses) as api:
+            result = watcher.tg_react(7, "\U0001f3a7")
+        self.assertTrue(result["ok"])
+        self.assertEqual(api.call_count, 2)
+        sent = json.loads(api.call_args[0][1]["reaction"])
+        self.assertEqual(sent[0]["emoji"], watcher.REACTION_ACK)
+
+    def test_valid_emoji_is_set_with_one_call(self):
+        with patch.object(watcher, "tg_api", return_value={"ok": True}) as api:
+            watcher.tg_react(7, watcher.REACTION_VOICE)
+        self.assertEqual(api.call_count, 1)
+
+    def test_invalid_default_emoji_is_not_retried_with_itself(self):
+        """Иначе заведомо отклонённый ⚡ уходил бы в Telegram дважды."""
+        response = {"ok": False, "description": "Bad Request: REACTION_INVALID"}
+        with patch.object(watcher, "tg_api", return_value=response) as api:
+            watcher.tg_react(7)
+        self.assertEqual(api.call_count, 1)
+
+    def test_other_failures_do_not_trigger_the_fallback(self):
+        response = {"ok": False, "description": "Bad Request: MESSAGE_ID_INVALID"}
+        with patch.object(watcher, "tg_api", return_value=response) as api:
+            watcher.tg_react(7, watcher.REACTION_VOICE)
+        self.assertEqual(api.call_count, 1)
+
+
 class TopicNotModifiedTests(unittest.TestCase):
     def test_sync_stops_renaming_after_topic_not_modified(self):
         """Иначе watcher переименовывает один и тот же топик в каждом цикле."""

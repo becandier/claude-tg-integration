@@ -215,14 +215,32 @@ def parse_bot_command(raw_text):
     return command_text, parts[0] if parts else ""
 
 
-def tg_react(message_id, emoji="\u26a1"):
-    """Ставит реакцию на сообщение как подтверждение доставки."""
-    params = {
+# Реакции ограничены фиксированным набором Telegram: 🎧 и 📝, например,
+# отклоняются с REACTION_INVALID, хотя чат не ограничивает available_reactions.
+REACTION_ACK = "\u26a1"           # принято и отправлено в сессию
+REACTION_VOICE = "\u270d\ufe0f"   # голосовое распознаётся в текст
+REACTION_REJECTED = "\U0001f44e"  # файл не принят
+
+
+def _set_reaction(message_id, emoji):
+    return tg_api("setMessageReaction", {
         "chat_id": CHAT_ID,
         "message_id": message_id,
         "reaction": json.dumps([{"type": "emoji", "emoji": emoji}]),
-    }
-    return tg_api("setMessageReaction", params)
+    })
+
+
+def tg_react(message_id, emoji=REACTION_ACK):
+    """Ставит реакцию на сообщение как подтверждение доставки.
+
+    Эмодзи вне набора Telegram получает REACTION_INVALID — тогда ставим
+    проверенный ⚡, чтобы подтверждение не пропадало молча.
+    """
+    response = _set_reaction(message_id, emoji)
+    if emoji != REACTION_ACK and "REACTION_INVALID" in response.get("description", ""):
+        logger.warning("[Reaction] %s не поддерживается Telegram, ставлю %s", emoji, REACTION_ACK)
+        response = _set_reaction(message_id, REACTION_ACK)
+    return response
 
 
 def tg_download_file(file_id, dest_path):
@@ -677,7 +695,7 @@ def handle_newstart(msg, text):
     project_name = os.path.basename(project_dir)
     agent_name = "Claude Code" if agent is AgentKind.CLAUDE else "Codex"
 
-    tg_react(user_msg_id, "⚡")
+    tg_react(user_msg_id)
 
     # Создаём Forum Topic для этой сессии. Модель ещё неизвестна — пока в
     # названии тип агента, sync_topic_titles заменит его, когда CLI запустится.
@@ -2337,7 +2355,7 @@ def main():
             if not text and voice:
                 file_id = voice.get("file_id")
                 if file_id:
-                    tg_react(msg.get("message_id"), "\U0001f3a7")
+                    tg_react(user_msg_id, REACTION_VOICE)
                     text = transcribe_voice(file_id)
                     if not text:
                         logger.info("Voice transcription failed, skipping")
@@ -2382,7 +2400,7 @@ def main():
                     text = f"{prefix} {text}" if text else prefix
                 else:
                     logger.warning(f"[Media] {media_label}: {media_error}")
-                    tg_react(user_msg_id, "\U0001f44e")
+                    tg_react(user_msg_id, REACTION_REJECTED)
                     tg_send(
                         f"⚠️ Не принял «{media_label}»: {media_error}. "
                         "Сожми файл, вырежи фрагмент или пришли локальный путь.",
