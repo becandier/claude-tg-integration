@@ -2430,15 +2430,9 @@ def main():
                 logger.info(f"Permission decline -> pane {pane_id}")
                 sent = tmux_send_keys(pane_id, "Escape")
             else:
-                text = (
-                    f"[TG | ~/.claude/tg-integration] {text}\n\n"
-                    "[SYSTEM] Сообщение из Telegram — примени скилл tg-chat."
-                    " В начале содержательного обсуждения выбери краткое название темы (3–6 слов, на языке пользователя)"
-                    " и выполни: python3 ~/.claude/tg-integration/tg_topic_title.py 'Название темы'."
-                    " Это разрешённое переименование текущего Telegram-топика; подтверждение не требуется."
-                    " При существенной смене темы обнови название той же командой;"
-                    " не меняй его для каждого ответа и не включай секреты или личные данные."
-                )
+                # Правила ответа и переименования топика живут в скилле tg-chat,
+                # префикс служит его триггером.
+                text = f"[TG | ~/.claude/tg-integration] {text}"
                 if not queue_if_blocked(pane_id, text, user_msg_id, topic_id):
                     continue
                 logger.info(f"Reply: {text[:80]} -> pane {pane_id}")
