@@ -30,11 +30,13 @@
 ## Как работает
 
 ```
-Telegram (Forum Topic) ──→ tg_reply_watcher.py ──tmux send-keys──→ Claude/Codex
+Telegram (Forum Topic) ──→ tg_reply_watcher.py ──tmux paste-buffer / send-keys──→ Claude/Codex
 Telegram (Forum Topic) ←── tg_stop_hook.sh ←───── Claude Stop hook
 Telegram (Forum Topic) ←── tg_notify_hook.sh ←─── Claude Notification hook
 Telegram (Forum Topic) ←── tg_stop_hook.sh ←──────── Codex Stop hook
 ```
+
+Текст попадает в CLI одним bracketed paste (`tmux paste-buffer -p`). Посимвольный набор `send-keys -l` Claude Code получает только для короткой однострочной реплики (до 120 символов): длинный набранный текст он теряет с начала.
 
 Каждая сессия живёт в отдельном Forum Topic — навигация между проектами в один тап.
 

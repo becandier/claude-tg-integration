@@ -70,6 +70,9 @@ _FS_CACHE_TTL = 30.0
 _is_project_cache = {}      # path -> (expires_at, bool)
 _nested_cache = {}          # (path, depth) -> (expires_at, bool)
 MEDIA_DIR = "/tmp/claude_tg_media"
+# До этой длины однострочный текст набирается в Claude Code через send-keys -l,
+# длиннее — вставляется bracketed paste (см. tmux_send).
+CLAUDE_TYPED_TEXT_LIMIT = 120
 # Bot API отдаёт через getFile файлы не больше 20 МБ (лимит на стороне Telegram).
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 # Виды медиа, которые мост принимает. Порядок важен: document проверяем последним,
@@ -461,24 +464,47 @@ def pane_exists(pane_id):
 
 
 def tmux_send(pane_id, text):
-    """Отправляет текст + Enter в tmux pane."""
+    """Отправляет текст + Enter в pane Claude Code.
+
+    Длинный или многострочный текст идёт единым bracketed paste: при наборе через
+    send-keys -l Claude Code терял начало, из ~3.9 тыс. символов доходили последние ~300.
+    Короткая однострочная реплика набирается как раньше, чтобы не получать обёртку
+    <pasted_content>.
+    """
     if not pane_exists(pane_id):
         return False
-    subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text])
-    # Длинный текст вызывает bracketed paste в Claude Code ([Pasted-text]).
-    # Нужна пауза, чтобы Claude Code успел обработать paste перед Enter.
-    if len(text) > 120:
+    if len(text) <= CLAUDE_TYPED_TEXT_LIMIT and "\n" not in text:
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text])
+    elif _tmux_paste(pane_id, text, "tg-claude"):
+        # Пауза, чтобы Claude Code успел свернуть вставку до Enter.
         time.sleep(0.5)
-    subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"])
-    return True
+    else:
+        return False
+    submitted = subprocess.run(
+        ["tmux", "send-keys", "-t", pane_id, "Enter"],
+        capture_output=True,
+        text=True,
+    )
+    return submitted.returncode == 0
 
 
 def tmux_send_codex(pane_id, text):
     """Отправляет Codex единый bracketed-paste event, затем отдельный Enter."""
     if not pane_exists(pane_id):
         return False
+    if not _tmux_paste(pane_id, text, "tg-codex"):
+        return False
+    submitted = subprocess.run(
+        ["tmux", "send-keys", "-t", pane_id, "Enter"],
+        capture_output=True,
+        text=True,
+    )
+    return submitted.returncode == 0
 
-    buffer_name = f"tg-codex-{os.getpid()}-{time.time_ns()}"
+
+def _tmux_paste(pane_id, text, buffer_prefix):
+    """Вставляет текст в pane одним bracketed paste через именованный tmux-буфер."""
+    buffer_name = f"{buffer_prefix}-{os.getpid()}-{time.time_ns()}"
     loaded = subprocess.run(
         ["tmux", "load-buffer", "-b", buffer_name, "-"],
         input=text,
@@ -503,13 +529,7 @@ def tmux_send_codex(pane_id, text):
             text=True,
         )
         return False
-
-    submitted = subprocess.run(
-        ["tmux", "send-keys", "-t", pane_id, "Enter"],
-        capture_output=True,
-        text=True,
-    )
-    return submitted.returncode == 0
+    return True
 
 
 def tmux_send_keys(pane_id, *keys):

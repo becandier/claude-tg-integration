@@ -175,5 +175,71 @@ class CodexInputTests(unittest.TestCase):
         )
 
 
+class ClaudeInputTests(unittest.TestCase):
+    @patch.object(watcher.time, "sleep")
+    @patch.object(watcher.time, "time_ns", return_value=123)
+    @patch.object(watcher.os, "getpid", return_value=456)
+    @patch.object(watcher, "pane_exists", return_value=True)
+    @patch.object(watcher.subprocess, "run")
+    def test_long_message_is_pasted_whole_before_enter(
+        self,
+        run,
+        _pane_exists,
+        _getpid,
+        _time_ns,
+        sleep,
+    ):
+        run.return_value = Mock(returncode=0)
+        text = "[TG | ~/.claude/tg-integration] " + "\n".join(
+            f"{n}. пункт списка — 3,9 ГБ" for n in range(1, 55)
+        )
+
+        self.assertTrue(watcher.tmux_send("%1", text))
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands, [
+            ["tmux", "load-buffer", "-b", "tg-claude-456-123", "-"],
+            [
+                "tmux", "paste-buffer", "-p", "-r", "-d",
+                "-b", "tg-claude-456-123", "-t", "%1",
+            ],
+            ["tmux", "send-keys", "-t", "%1", "Enter"],
+        ])
+        self.assertEqual(run.call_args_list[0].kwargs["input"], text)
+        sleep.assert_called_once_with(0.5)
+
+    @patch.object(watcher.time, "sleep")
+    @patch.object(watcher, "pane_exists", return_value=True)
+    @patch.object(watcher.subprocess, "run")
+    def test_failed_paste_is_not_submitted(self, run, _pane_exists, _sleep):
+        run.side_effect = [
+            Mock(returncode=0),
+            Mock(returncode=1),
+            Mock(returncode=0),
+        ]
+
+        self.assertFalse(watcher.tmux_send("%1", "строка один\nстрока два"))
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[2][:2], ["tmux", "delete-buffer"])
+        self.assertNotIn(["tmux", "send-keys", "-t", "%1", "Enter"], commands)
+
+    @patch.object(watcher.time, "sleep")
+    @patch.object(watcher, "pane_exists", return_value=True)
+    @patch.object(watcher.subprocess, "run")
+    def test_short_single_line_is_typed(self, run, _pane_exists, sleep):
+        run.return_value = Mock(returncode=0)
+        text = "[TG | ~/.claude/tg-integration] да исправь"
+
+        self.assertTrue(watcher.tmux_send("%1", text))
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands, [
+            ["tmux", "send-keys", "-t", "%1", "-l", text],
+            ["tmux", "send-keys", "-t", "%1", "Enter"],
+        ])
+        sleep.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
