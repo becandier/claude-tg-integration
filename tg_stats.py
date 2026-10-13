@@ -207,8 +207,15 @@ _CC_CONTEXT_MODEL_RE = re.compile(
 
 
 def parse_claude_context_model(output: str) -> str:
-    """Название модели из блока `/context`; пустая строка, если его нет."""
-    match = _CC_CONTEXT_MODEL_RE.search(output or "")
+    """Название модели из блока `/context`; пустая строка, если его нет.
+
+    Ищем после последнего заголовка блока: выше в транскрипте остаются
+    приветственная шапка и строки `Set model to …` с прежними моделями.
+    """
+    output = output or ""
+    if CLAUDE_CONTEXT_MARKER in output:
+        output = output.rsplit(CLAUDE_CONTEXT_MARKER, 1)[1]
+    match = _CC_CONTEXT_MODEL_RE.search(output)
     return match.group(1).strip() if match else ""
 
 

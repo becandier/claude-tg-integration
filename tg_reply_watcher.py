@@ -89,13 +89,16 @@ MEDIA_KINDS = (
 sys.path.insert(0, os.path.expanduser("~/.claude/tg-integration"))
 import tg_sessions
 import tg_stats
+from tg_codex_submit_hook import PROMPT_MARKER, REACTION_READING, message_id_from_prompt
 from tg_topic_title import format_topic_name
 from agent_runtime import (
     AgentKind,
+    CLAUDE_MODEL_PICKER_MARKER,
     LaunchSpec,
     build_launch_argv,
     is_managed_session,
     make_session_name,
+    parse_claude_model_picker,
     parse_codex_effort_picker,
     parse_codex_model_picker,
     parse_newstart_args,
@@ -106,6 +109,7 @@ from agent_runtime import (
     terminal_effort,
     terminal_ready,
     parse_codex_update_picker,
+    parse_codex_rate_limit_picker,
 )
 
 logger = logging.getLogger("watcher")
@@ -121,16 +125,16 @@ def setup_logging():
     logger.setLevel(logging.INFO)
 
 
-def tg_api(method, params=None):
+def tg_api(method, params=None, *, max_attempts=None, request_timeout=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = urllib.parse.urlencode(params).encode() if params else None
     # getUpdates — long polling, ретраи не нужны (main loop сам обработает).
     # Остальные методы ретраим до 3 раз при сетевых ошибках.
-    max_attempts = 1 if method == "getUpdates" else 3
+    max_attempts = max_attempts if max_attempts is not None else (1 if method == "getUpdates" else 3)
     for attempt in range(max_attempts):
         try:
             req = urllib.request.Request(url, data=data)
-            timeout = 35 if method == "getUpdates" else 10
+            timeout = request_timeout if request_timeout is not None else (35 if method == "getUpdates" else 10)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
@@ -218,6 +222,13 @@ def parse_bot_command(raw_text):
     return command_text, parts[0] if parts else ""
 
 
+def agent_prompt(text, agent, message_id):
+    prefix = PROMPT_MARKER
+    if agent is AgentKind.CODEX and isinstance(message_id, int):
+        prefix += f" [tg-message-id:{message_id}]"
+    return f"{prefix} {text}"
+
+
 # Реакции ограничены фиксированным набором Telegram: 🎧 и 📝, например,
 # отклоняются с REACTION_INVALID, хотя чат не ограничивает available_reactions.
 REACTION_ACK = "\u26a1"           # принято и отправлено в сессию
@@ -225,12 +236,12 @@ REACTION_VOICE = "\u270d\ufe0f"   # голосовое распознаётся 
 REACTION_REJECTED = "\U0001f44e"  # файл не принят
 
 
-def _set_reaction(message_id, emoji):
+def _set_reaction(message_id, emoji, *, quick=False):
     return tg_api("setMessageReaction", {
         "chat_id": CHAT_ID,
         "message_id": message_id,
         "reaction": json.dumps([{"type": "emoji", "emoji": emoji}]),
-    })
+    }, **({"max_attempts": 1, "request_timeout": 2} if quick else {}))
 
 
 def tg_react(message_id, emoji=REACTION_ACK):
@@ -500,6 +511,41 @@ def tmux_send_codex(pane_id, text):
         text=True,
     )
     return submitted.returncode == 0
+
+
+def _codex_delivery_context(pane_id):
+    """Get the rollout position before a prompt is delivered, including old CLI sessions."""
+    session_id = tg_sessions.get_session_id(pane_id)
+    path = tg_stats.find_codex_rollout(session_id) if session_id else ""
+    if not path:
+        try:
+            pane = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
+                capture_output=True, text=True, timeout=3,
+            )
+            pid = pane.stdout.strip()
+            if pane.returncode != 0 or not pid.isdigit():
+                return None
+            opened = subprocess.run(
+                ["lsof", "-p", pid, "-Fn"], capture_output=True, text=True, timeout=5,
+            )
+            root = os.path.join(tg_stats.CODEX_HOME, "sessions") + os.sep
+            for line in opened.stdout.splitlines():
+                if not line.startswith("n") or not line[1:].startswith(root):
+                    continue
+                candidate = line[1:]
+                match = re.search(r"-([0-9a-f-]{36})\.jsonl$", candidate)
+                if match and tg_stats.find_codex_rollout(match.group(1)) == candidate:
+                    session_id, path = match.group(1), candidate
+                    break
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    if not path:
+        return None
+    try:
+        return session_id, os.path.getsize(path)
+    except OSError:
+        return None
 
 
 def _tmux_paste(pane_id, text, buffer_prefix):
@@ -1241,8 +1287,15 @@ MODEL_FALLBACK = [
     {"alias": "fable", "label": "Fable", "desc": "", "current": False},
 ]
 
-# Строка пикера: "  ❯ 3. Fable ✔                Fable 5 · Most capable..."
-_MODEL_LINE_RE = re.compile(r"^\s*(?:❯\s*)?\d+\.\s+(.+?)\s{2,}(.+?)\s*$")
+# Диалог Claude Code 2.1.29x при смене модели с закэшированной историей:
+# "Switch model? … ❯ 1. Yes, switch to Opus 5.5 / 2. No, go back".
+CLAUDE_SWITCH_DIALOG_MARKER = "Switch model?"
+# Итог /model в транскрипте: "⎿  Set model to Opus 5.5 for this session only",
+# "⎿  Set model to Fable 5.1 and saved as your default…", "⎿  Kept model as Fable 5.1".
+_CLAUDE_MODEL_RESULT_RE = re.compile(r"(?:Set model to|Kept model as)\s+\S")
+CLAUDE_MODEL_SWITCH_TIMEOUT = 4.0
+# Пауза перед сверкой через пикер, когда итоговая строка неотличима от прежней.
+CLAUDE_MODEL_SWITCH_GRACE = 1.5
 
 
 def _capture_pane(pane_id):
@@ -1311,7 +1364,9 @@ def queue_if_blocked(pane_id, text, message_id, topic_id):
     starting = pane_id in state.get("pane_to_startup", {})
     queued = bool(state.get("pane_to_pending", {}).get(pane_id))
     if not starting and not queued:
-        if agent is AgentKind.CLAUDE or terminal_ready(_capture_pane(pane_id), agent):
+        if agent is AgentKind.CLAUDE or terminal_ready(
+            _capture_pane(pane_id), agent, allow_working=True,
+        ):
             return True
     tg_sessions.queue_message(pane_id, text, message_id)
     tg_send("⏳ Сообщение сохранено. Отправлю, когда чат будет готов к вводу.", topic_id=topic_id)
@@ -1353,6 +1408,14 @@ def check_starting_sessions():
                     tg_sessions.save_startup(pane_id, state)
                     tg_send("⚠️ Не удалось перезапустить Codex после обновления. Сообщения сохранены; проверь терминал.\n" + restarted.stderr[-1000:], topic_id=topic_id)
                 continue
+        if agent is AgentKind.CODEX:
+            options = parse_codex_rate_limit_picker(output)
+            if options:
+                # Keep the user's model; never opt out of reminders globally.
+                # Re-capture on the next poll before delivering queued text.
+                if _choose_picker_option(pane_id, options, "2"):
+                    logger.info("[RateLimit] Kept current model in pane %s; waiting for composer", pane_id)
+                continue
         if state:
             keys = claude_trust_navigation_keys(output) if agent is AgentKind.CLAUDE else None
             if agent is AgentKind.CODEX and (
@@ -1363,7 +1426,7 @@ def check_starting_sessions():
             if keys:
                 tmux_send_keys(pane_id, *keys)
                 continue
-        if terminal_ready(output, agent):
+        if terminal_ready(output, agent, allow_working=(agent is AgentKind.CODEX and not state)):
             _startup_notices.pop(pane_id, None)
             if state:
                 model = terminal_model(output, agent)
@@ -1388,9 +1451,14 @@ def check_starting_sessions():
             if messages:
                 item = messages[0]
                 send = tmux_send_codex if agent is AgentKind.CODEX else tmux_send
+                delivery = _codex_delivery_context(pane_id) if agent is AgentKind.CODEX else None
                 if send(pane_id, item["text"]):
                     tg_sessions.save_reply_to(pane_id, item["message_id"])
                     tg_sessions.ack_message(pane_id, item["message_id"])
+                    if delivery:
+                        tg_sessions.start_codex_progress(
+                            pane_id, delivery[0], "", delivery[1],
+                        )
                     tg_react(item["message_id"])
                     mark_pane_waiting(pane_id)
             continue
@@ -1418,10 +1486,10 @@ def check_starting_sessions():
 
 
 def _input_line(pane_id):
-    """Нижняя строка ввода Claude (`❯`) или Codex (`›`)."""
+    """Нижняя строка ввода Claude (`❯`) или Codex (`›` / `»`)."""
     lines = [
         line for line in _capture_pane(pane_id).split("\n")
-        if line.lstrip().startswith(("❯", "›"))
+        if line.lstrip().startswith(("❯", "›", "»"))
     ]
     return lines[-1] if lines else ""
 
@@ -1514,19 +1582,21 @@ def _set_codex_effort(pane_id, level):
 
 def _probe_codex_models(pane_id):
     output = _open_codex_model_picker(pane_id)
-    options = parse_codex_model_picker(output)
-    if not options:
-        return None
-    tmux_send_keys(pane_id, "Escape")
-    return [
-        {
-            "alias": option.value,
-            "label": option.label,
-            "desc": "",
-            "current": option.current,
-        }
-        for option in options
-    ]
+    try:
+        options = parse_codex_model_picker(output)
+        if not options:
+            return None
+        return [
+            {
+                "alias": option.value,
+                "label": option.label,
+                "desc": "",
+                "current": option.current,
+            }
+            for option in options
+        ]
+    finally:
+        _close_codex_picker(pane_id)
 
 
 def probe_models(pane_id, agent=AgentKind.CLAUDE):
@@ -1542,27 +1612,16 @@ def probe_models(pane_id, agent=AgentKind.CLAUDE):
         return None
     time.sleep(2)
     out = _capture_pane(pane_id)
-    if "Select model" not in out:
+    if CLAUDE_MODEL_PICKER_MARKER not in out:
         # Пикер не открылся — Escape не шлём (мог бы прервать текущий ход),
         # только чистим возможный остаток ввода.
         subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-u"])
         return None
     subprocess.run(["tmux", "send-keys", "-t", pane_id, "Escape"])
-    models = []
-    for line in out.split("Select model", 1)[1].split("\n"):
-        m = _MODEL_LINE_RE.match(line)
-        if not m:
-            continue
-        label, desc = m.group(1).strip(), m.group(2).strip()
-        current = "✔" in label or "✔" in desc
-        label = label.replace("✔", "").strip()
-        alias = label.split()[0].lower().strip(".")
-        if not alias.isalpha():
-            continue
-        models.append({
-            "alias": alias, "label": label,
-            "desc": desc.replace("✔", "").strip(), "current": current,
-        })
+    models = [
+        {"alias": o.value, "label": o.label, "desc": o.description, "current": o.current}
+        for o in parse_claude_model_picker(out)
+    ]
     return models or None
 
 
@@ -1594,10 +1653,10 @@ def _model_text(current, effort=""):
 
 def _set_codex_model(pane_id, alias):
     output = _open_codex_model_picker(pane_id)
-    models = parse_codex_model_picker(output)
-    if not models or not _choose_picker_option(pane_id, models, alias):
-        return False
     try:
+        models = parse_codex_model_picker(output)
+        if not models or not _choose_picker_option(pane_id, models, alias):
+            return False
         effort = tg_sessions.get_effort(pane_id)
         reasoning_output = _wait_for_picker(pane_id, "Select Reasoning Level")
         reasoning_options = parse_codex_effort_picker(reasoning_output)
@@ -1638,13 +1697,130 @@ def _close_codex_picker(pane_id):
         time.sleep(0.2)
 
 
+def _tmux_type(pane_id, text):
+    """Литеральный ввод без интерпретации имён клавиш tmux."""
+    result = subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", text], capture_output=True)
+    return result.returncode == 0
+
+
+def _confirm_claude_switch(pane_id, output):
+    """В диалоге «Switch model?» вариант 1 «Yes, switch» выделен по умолчанию."""
+    if re.search(r"❯\s*2\.", output) and not tmux_send_keys(pane_id, "Up"):
+        return False
+    return tmux_send_keys(pane_id, "Enter")
+
+
+def _latest_claude_result(output):
+    """Последняя строка `Set model to…`/`Kept model as…` среди пяти непустых
+    строк над композером — свежая запись транскрипта, а не история выше."""
+    lines = output.split("\n")
+    composer = None
+    for index in range(len(lines) - 1, -1, -1):
+        body = lines[index].lstrip()
+        if body.startswith("❯") and not re.match(r"❯\s*\d+\.", body):
+            composer = index
+            break
+    if composer is None:
+        return ""
+    recent = [line.strip() for line in lines[:composer] if line.strip()][-5:]
+    for line in reversed(recent):
+        if _CLAUDE_MODEL_RESULT_RE.search(line):
+            return line
+    return ""
+
+
+def _claude_model_is(pane_id, alias):
+    """Проверка через живой пикер: ✔ стоит на нужной модели."""
+    models = probe_models(pane_id) or []
+    return any(m["current"] and m["alias"] == alias for m in models)
+
+
+def _finish_claude_model_switch(pane_id, before, verify=None, timeout=None):
+    """Ждёт итог `/model`: подтверждает диалог про закэшированную историю,
+    зависший пикер или диалог закрывает Escape.
+
+    Успех — новая строка результата над композером. Если она совпадает с уже
+    видимой до команды и счётчик не вырос (старая могла уйти за верх экрана),
+    через паузу решает `verify`; без него такой итог считается успехом.
+    """
+    timeout = CLAUDE_MODEL_SWITCH_TIMEOUT if timeout is None else timeout
+    before_result = _latest_claude_result(before)
+    before_count = len(_CLAUDE_MODEL_RESULT_RE.findall(before))
+    confirmed = False
+    started = time.time()
+    deadline = started + timeout
+    while True:
+        output = _capture_pane(pane_id)
+        if CLAUDE_SWITCH_DIALOG_MARKER in output:
+            if not confirmed:
+                confirmed = _confirm_claude_switch(pane_id, output)
+        elif CLAUDE_MODEL_PICKER_MARKER not in output:
+            result = _latest_claude_result(output)
+            if result and (result != before_result
+                           or len(_CLAUDE_MODEL_RESULT_RE.findall(output)) > before_count):
+                return True
+            if result and time.time() - started >= CLAUDE_MODEL_SWITCH_GRACE:
+                return verify() if verify else True
+        if time.time() >= deadline:
+            break
+        time.sleep(0.3)
+    if CLAUDE_SWITCH_DIALOG_MARKER in output or CLAUDE_MODEL_PICKER_MARKER in output:
+        tmux_send_keys(pane_id, "Escape")
+    return False
+
+
+def _set_claude_model(pane_id, alias):
+    """Меняет модель только для сессии: пикер `/model` → нужная строка → `s`.
+
+    Прямая команда `/model <имя>` в Claude Code 2.1.29x сохраняет выбор ещё и
+    как default для новых сессий, поэтому используется лишь для имён, которых
+    в пикере нет (полные идентификаторы). В обоих случаях CLI может спросить
+    «Switch model?», если история закэширована под текущую модель.
+    """
+    before = _capture_pane(pane_id)
+    if not _type_command(pane_id, "/model"):
+        return False
+    options = parse_claude_model_picker(_wait_for_picker(pane_id, CLAUDE_MODEL_PICKER_MARKER))
+    if not options:
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-u"])
+        return False
+    if any(option.value == alias for option in options):
+        try:
+            keys = picker_navigation_keys(options, alias)
+        except ValueError:
+            tmux_send_keys(pane_id, "Escape")
+            return False
+        if keys and not tmux_send_keys(pane_id, *keys):
+            return False
+        if not _tmux_type(pane_id, "s"):
+            return False
+        verify = None if alias == "default" else (lambda: _claude_model_is(pane_id, alias))
+        return _finish_claude_model_switch(pane_id, before, verify)
+    # Имени нет в пикере: закрываем его ("Kept model as …" попадёт в before)
+    # и отдаём имя напрямую CLI.
+    tmux_send_keys(pane_id, "Escape")
+    time.sleep(0.5)
+    before = _capture_pane(pane_id)
+    if not _type_command(pane_id, f"/model {alias}"):
+        return False
+    return _finish_claude_model_switch(pane_id, before)
+
+
+def _session_model(pane_id, agent, screen):
+    """Модель сессии. У Claude сохранённый выбор свежее приветственной шапки:
+    после смены через /model шапка показывает прежнюю модель."""
+    if agent is AgentKind.CLAUDE:
+        return tg_sessions.get_model(pane_id) or terminal_model(screen, agent)
+    return terminal_model(screen, agent) or tg_sessions.get_model(pane_id)
+
+
 def set_session_model(pane_id, alias, agent=AgentKind.CLAUDE):
     """Меняет модель через нативный интерфейс активного агента."""
     if not pane_exists(pane_id):
         return False
     if agent is AgentKind.CODEX:
         return _set_codex_model(pane_id, alias)
-    return _type_command(pane_id, f"/model {alias}")
+    return _set_claude_model(pane_id, alias)
 
 
 def handle_model(msg, text):
@@ -1685,7 +1861,10 @@ def handle_model(msg, text):
                 }] if saved else [])
             else:
                 models = MODEL_FALLBACK
-            note = "\n⚠️ Не смог прочитать пикер — список может быть неполным"
+            if agent is AgentKind.CODEX and not terminal_ready(_capture_pane(pane_id), agent):
+                note = "\n⏳ Сейчас агент занят — открой /model после завершения ответа"
+            else:
+                note = "\n⚠️ Не смог прочитать пикер — список может быть неполным"
         current = next(
             (m["alias"] for m in models if m["current"]),
             tg_sessions.get_model(pane_id),
@@ -1793,10 +1972,10 @@ def probe_claude_stats(pane_id):
     pane = _capture_pane(pane_id)
     stats = tg_stats.SessionStats(
         agent=AgentKind.CLAUDE.value,
-        model=terminal_model(pane, AgentKind.CLAUDE),
         effort=_current_effort(pane_id, AgentKind.CLAUDE),
     )
     if not terminal_ready(pane, AgentKind.CLAUDE):
+        stats.model = _session_model(pane_id, AgentKind.CLAUDE, pane)
         stats.context = _claude_transcript_context(
             pane_id, tg_stats.claude_context_window(pane),
         )
@@ -1808,8 +1987,9 @@ def probe_claude_stats(pane_id):
         screen = _wait_for_render(pane_id, CLAUDE_CONTEXT_TAIL_RE, pane)
         stats.context = tg_stats.parse_claude_context(screen)
         window = tg_stats.parse_claude_autocompact_window(screen) or window
-        stats.model = stats.model or tg_stats.parse_claude_context_model(screen)
-    stats.model = stats.model or tg_sessions.get_model(pane_id)
+        # Блок /context — единственный живой источник модели сессии.
+        stats.model = tg_stats.parse_claude_context_model(screen)
+    stats.model = stats.model or _session_model(pane_id, AgentKind.CLAUDE, pane)
     if stats.context is None:
         # Узкий терминал выталкивает шапку блока за кадр: токены берём из
         # транскрипта, размер окна — из уцелевшей строки Auto-compact window.
@@ -1989,6 +2169,98 @@ def check_dead_panes():
             tg_send(f"⏳ {agent_name} всё ещё работает...", topic_id=topic_id)
             activity["notified_working"] = True
             logger.info(f"[Activity] pane {pane_id} still working ({idle_time:.0f}s)")
+
+
+def _codex_commentary(record):
+    if record.get("type") != "response_item":
+        return ""
+    item = record.get("payload", {})
+    if item.get("type") != "message" or item.get("role") != "assistant" or item.get("phase") != "commentary":
+        return ""
+    return "".join(
+        part.get("text", "") for part in item.get("content", [])
+        if isinstance(part, dict) and part.get("type") == "output_text"
+    ).strip()
+
+
+def _codex_user_message_id(record):
+    if record.get("type") != "response_item":
+        return None
+    item = record.get("payload", {})
+    if item.get("type") != "message" or item.get("role") != "user":
+        return None
+    for part in item.get("content", []):
+        if isinstance(part, dict) and part.get("type") == "input_text":
+            message_id = message_id_from_prompt(part.get("text", ""))
+            if message_id is not None:
+                return message_id
+    return None
+
+
+def _codex_progress_records(path, offset, limit=100):
+    """Read complete new JSONL records; leave a partially written line for later."""
+    with open(path, "rb") as handle:
+        handle.seek(offset)
+        for _ in range(limit):
+            line = handle.readline(2 * 1024 * 1024 + 1)
+            if not line:
+                break
+            if not line.endswith(b"\n"):
+                if len(line) <= 2 * 1024 * 1024:
+                    break
+                # Oversized tool output: skip the record without loading it.
+                while line and not line.endswith(b"\n"):
+                    line = handle.readline(64 * 1024)
+                if line:
+                    yield handle.tell(), {}
+                continue
+            end = handle.tell()
+            try:
+                yield end, json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                yield end, {}
+
+
+def poll_codex_progress():
+    """Forward only assistant commentary from Telegram-initiated Codex turns."""
+    states = tg_sessions._load().get("pane_to_codex_progress", {})
+    for pane_id, state in states.items():
+        if not state.get("active") or tg_sessions.get_agent(pane_id) != AgentKind.CODEX.value:
+            continue
+        session_id = state.get("session_id", "")
+        path = tg_stats.find_codex_rollout(session_id)
+        if not path:
+            continue
+        try:
+            records = list(_codex_progress_records(path, state.get("offset", 0)))
+        except OSError:
+            continue
+        turn_id = state.get("turn_id", "")
+        completed = any(
+            record.get("type") == "event_msg"
+            and record.get("payload", {}).get("type") == "task_complete"
+            and (not turn_id or record["payload"].get("turn_id") == turn_id)
+            for _, record in records
+        )
+        topic_id = tg_sessions.get_topic(pane_id)
+        for offset, record in records:
+            message_id = _codex_user_message_id(record)
+            if message_id is not None:
+                response = _set_reaction(message_id, REACTION_READING, quick=True)
+                if not response.get("ok"):
+                    return
+            message = _codex_commentary(record)
+            if message and not completed and topic_id:
+                # Plain text avoids Telegram HTML parse errors for arbitrary Markdown.
+                reply_to = tg_sessions.get_reply_to(pane_id)
+                chunks = [message[i:i + 3500] for i in range(0, len(message), 3500)]
+                for chunk in chunks:
+                    response = tg_send("💬 Codex: " + chunk, topic_id=topic_id, reply_to=reply_to)
+                    if not response.get("ok"):
+                        return
+            tg_sessions.update_codex_progress(pane_id, session_id, turn_id, offset)
+        if completed and records:
+            tg_sessions.update_codex_progress(pane_id, session_id, turn_id, records[-1][0], active=False)
 
 
 def handle_callback(callback_query):
@@ -2174,7 +2446,7 @@ def handle_callback(callback_query):
             "callback_query_id": cb_id,
             "text": f"Эффорт: {level}",
         })
-        model = terminal_model(_capture_pane(pane_id), agent) or tg_sessions.get_model(pane_id)
+        model = _session_model(pane_id, agent, _capture_pane(pane_id))
         model_rows = [
             [button for button in row if button.get("callback_data", "").startswith("model:")]
             for row in (msg.get("reply_markup") or {}).get("inline_keyboard", [])
@@ -2274,10 +2546,15 @@ def main():
         try:
             check_starting_sessions()
             sync_topic_titles()
+            poll_codex_progress()
         except Exception:
             logger.exception("[Startup] Cannot process startup or pending messages")
         session_data = tg_sessions._load()
-        waiting = bool(session_data.get("pane_to_startup") or session_data.get("pane_to_pending"))
+        waiting = bool(
+            session_data.get("pane_to_startup") or session_data.get("pane_to_pending")
+            or any(s.get("active") for s in session_data.get("pane_to_codex_progress", {}).values())
+            or "codex" in session_data.get("pane_to_agent", {}).values()
+        )
         offset = get_offset()
         data = tg_api("getUpdates", {
             "offset": offset,
@@ -2452,10 +2729,11 @@ def main():
             else:
                 # Правила ответа и переименования топика живут в скилле tg-chat,
                 # префикс служит его триггером.
-                text = f"[TG | ~/.claude/tg-integration] {text}"
+                text = agent_prompt(text, AgentKind.CLAUDE if is_claude else AgentKind.CODEX, user_msg_id)
                 if not queue_if_blocked(pane_id, text, user_msg_id, topic_id):
                     continue
-                logger.info(f"Reply: {text[:80]} -> pane {pane_id}")
+                logger.info("Reply: %s chars -> pane %s", len(text), pane_id)
+                delivery = _codex_delivery_context(pane_id) if not is_claude else None
                 sent = (
                     tmux_send(pane_id, text)
                     if is_claude
@@ -2464,6 +2742,10 @@ def main():
 
             if sent:
                 tg_sessions.save_reply_to(pane_id, user_msg_id)
+                if not is_claude and delivery:
+                    tg_sessions.start_codex_progress(
+                        pane_id, delivery[0], "", delivery[1],
+                    )
                 tg_react(user_msg_id)
                 mark_pane_waiting(pane_id)
                 logger.info("  OK")

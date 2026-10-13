@@ -29,6 +29,7 @@ class PickerOption:
     label: str
     selected: bool = False
     current: bool = False
+    description: str = ""
 
 
 _SAFE_SESSION_RE = re.compile(r"^(?:claude|codex)-[a-zA-Z0-9_-]+$")
@@ -95,11 +96,11 @@ def terminal_model(output: str, agent: AgentKind) -> str:
     """Read the live footer first; the Codex welcome header can be stale."""
     if agent is AgentKind.CODEX:
         for line in reversed(output.splitlines()):
-            match = re.match(r"\s*((?:gpt-|codex-|o\d)[\w.:/-]+)\s+.*·", line)
+            match = re.match(r"\s*((?:gpt-|codex-|o\d)[\w.:/-]+)\s+.*·", line, re.I)
             if match:
-                return match.group(1)
-        match = re.search(r"model:\s+([\w.:/-]+)", output)
-        return match.group(1) if match else ""
+                return match.group(1).lower()
+        match = re.search(r"model:\s+([\w.:/-]+)", output, re.I)
+        return match.group(1).lower() if match else ""
     for line in output.splitlines():
         match = re.search(r"\b((?:Opus|Sonnet|Haiku|Fable)\s+[\d.]+(?:\s*\([^)]*\))?)(?:\s+with\s+\w+\s+effort)?\s*·", line)
         if match:
@@ -110,9 +111,9 @@ def terminal_model(output: str, agent: AgentKind) -> str:
 def terminal_effort(output: str, agent: AgentKind) -> str:
     if agent is AgentKind.CODEX:
         for line in reversed(output.splitlines()):
-            match = re.match(r"\s*(?:gpt-|codex-|o\d)[\w.:/-]+\s+(\w+)\s*·", line)
+            match = re.match(r"\s*(?:gpt-|codex-|o\d)[\w.:/-]+\s+(\w+)\s*·", line, re.I)
             if match:
-                return match.group(1)
+                return match.group(1).lower()
     else:
         match = re.search(r"\bwith\s+(\w+)\s+effort\s*·", output)
         if match:
@@ -120,15 +121,17 @@ def terminal_effort(output: str, agent: AgentKind) -> str:
     return ""
 
 
-def terminal_ready(output: str, agent: AgentKind) -> bool:
-    """Require a composer, never mistake a menu cursor for one."""
-    marker = "›" if agent is AgentKind.CODEX else "❯"
-    cursors = [line.strip() for line in output.splitlines() if line.lstrip().startswith(marker)]
-    if not cursors or re.match(r"[›❯]\s*\d+\.", cursors[-1]):
+def terminal_ready(output: str, agent: AgentKind, *, allow_working: bool = False) -> bool:
+    """Require a composer; active Codex turns accept text but not slash commands."""
+    markers = ("›", "»") if agent is AgentKind.CODEX else ("❯",)
+    cursors = [line.strip() for line in output.splitlines() if line.lstrip().startswith(markers)]
+    if not cursors or re.match(r"[›»❯]\s*\d+\.", cursors[-1]):
         return False
     tail = output[output.rfind(cursors[-1]):]
     recent = "\n".join([line for line in output.splitlines() if line.strip()][-6:])
-    if re.search(r"esc to interrupt|Working \(|esc to cancel", recent, re.I):
+    if re.search(r"esc to interrupt|Working \(|esc to cancel", recent, re.I) and not (
+        allow_working and agent is AgentKind.CODEX
+    ):
         return False
     if agent is AgentKind.CODEX:
         return bool(terminal_model(tail, agent))
@@ -148,6 +151,36 @@ def parse_codex_update_picker(output: str) -> list[PickerOption]:
     return options
 
 
+def parse_codex_rate_limit_picker(output: str) -> list[PickerOption]:
+    """Recognize the active model nudge, never a quota error or an old dialog."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines or lines[-1] != "enter select · esc back":
+        return []
+    headings = [i for i, line in enumerate(lines) if line == "Approaching rate limits"]
+    if not headings:
+        return []
+    dialog = lines[headings[-1]:]
+    if len(dialog) != 6 or not re.fullmatch(
+        r"Switch to [\w./:-]+ for lower credit usage\?", dialog[1],
+    ):
+        return []
+    options = []
+    for number, line in enumerate(dialog[2:5], start=1):
+        match = re.fullmatch(r"([›»])?\s*" + str(number) + r"\.\s+(.+)", line)
+        if not match:
+            return []
+        label = re.split(r"\s{2,}", match.group(2), maxsplit=1)[0]
+        options.append(PickerOption(str(number), label, bool(match.group(1))))
+    if (
+        options[0].label != dialog[1].removesuffix(" for lower credit usage?")
+        or options[1].label != "Keep current model"
+        or options[2].label != "Keep current model (never show again)"
+        or sum(option.selected for option in options) != 1
+    ):
+        return []
+    return options
+
+
 def parse_codex_model_picker(output: str) -> list[PickerOption]:
     options = []
     for line in output.splitlines():
@@ -158,7 +191,7 @@ def parse_codex_model_picker(output: str) -> list[PickerOption]:
         model_match = re.match(r"([a-zA-Z0-9][a-zA-Z0-9._:/-]*)", payload)
         if not model_match:
             continue
-        model = model_match.group(1)
+        model = model_match.group(1).lower()
         if not model.startswith(("gpt-", "o", "codex-")):
             continue
         options.append(PickerOption(
@@ -166,6 +199,37 @@ def parse_codex_model_picker(output: str) -> list[PickerOption]:
             label=model,
             selected=selected,
             current="(current)" in payload,
+        ))
+    return options
+
+
+CLAUDE_MODEL_PICKER_MARKER = "Select model"
+# Строка пикера Claude: "  ❯ 3. Fable ✔                Fable 5.1 · Most capable..."
+_CLAUDE_MODEL_LINE_RE = re.compile(r"^\s*(?:❯\s*)?\d+\.\s+(.+?)\s{2,}(.+?)\s*$")
+
+
+def parse_claude_model_picker(output: str) -> list[PickerOption]:
+    """Пикер `/model` Claude Code: value — алиас CLI (первое слово строки),
+    ✔ помечает модель сессии, ❯ — выделенную строку, description — колонка справа."""
+    if CLAUDE_MODEL_PICKER_MARKER not in output:
+        return []
+    options = []
+    for line in output.split(CLAUDE_MODEL_PICKER_MARKER, 1)[1].splitlines():
+        match = _CLAUDE_MODEL_LINE_RE.match(line)
+        if not match:
+            continue
+        label, description = match.group(1).strip(), match.group(2).strip()
+        current = "✔" in label or "✔" in description
+        label = label.replace("✔", "").strip()
+        alias = label.split()[0].lower().strip(".")
+        if not alias.isalpha():
+            continue
+        options.append(PickerOption(
+            value=alias,
+            label=label,
+            selected=line.lstrip().startswith("❯"),
+            current=current,
+            description=description.replace("✔", "").strip(),
         ))
     return options
 

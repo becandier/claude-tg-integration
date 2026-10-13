@@ -127,6 +127,21 @@ class SessionLifecycleTests(unittest.TestCase):
 
 
 class CodexPickerTests(unittest.TestCase):
+    def test_parses_uppercase_models_from_live_codex_picker(self):
+        output = """
+  Select Model and Effort
+
+  1. GPT-6-Astra (default)  Frontier intelligence.
+› 2. GPT-6-Sol (current)    Workhorse model.
+  3. GPT-6-Luna             Fast model.
+"""
+        options = parse_codex_model_picker(output)
+        self.assertEqual([option.value for option in options], [
+            "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+        ])
+        self.assertTrue(options[1].selected)
+        self.assertTrue(options[1].current)
+
     def test_parses_models_and_current_selection(self):
         output = """
   Select Model and Effort

@@ -26,6 +26,16 @@ class ModelEffortDisplayTests(unittest.TestCase):
         buttons=send.call_args.kwargs['reply_markup']['inline_keyboard']
         self.assertTrue(any(b['callback_data']=='effort:medium' and '✅' in b['text'] for row in buttons for b in row))
 
+    @patch.object(watcher, 'tg_send')
+    @patch.object(watcher.tg_sessions, 'get_model', return_value='gpt-6-sol')
+    @patch.object(watcher.tg_sessions, 'get_agent', return_value='codex')
+    @patch.object(watcher.tg_sessions, 'get_pane_by_topic', return_value='%1')
+    @patch.object(watcher, '_capture_pane', return_value='• Working (1m • esc to interrupt)\n› Ask Codex to do anything\n  GPT-6-Sol medium · /tmp')
+    @patch.object(watcher, 'probe_models', return_value=None)
+    def test_model_menu_explains_busy_codex_picker(self, *_):
+        watcher.handle_model({'message_thread_id': 42}, '/model')
+        self.assertIn('агент занят', watcher.tg_send.call_args.args[0])
+
     def test_effort_button_keeps_model_menu_and_shows_both_settings(self):
         from contextlib import ExitStack
         with ExitStack() as stack:

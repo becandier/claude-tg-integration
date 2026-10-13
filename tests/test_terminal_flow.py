@@ -9,6 +9,12 @@ class TerminalStateTests(unittest.TestCase):
         output = '│ model: gpt-6-astra medium /model to change │\n› Ask Codex to do anything\n  gpt-5.6-sol low · /tmp'
         self.assertEqual(runtime.terminal_model(output, runtime.AgentKind.CODEX), 'gpt-5.6-sol')
 
+    def test_codex_accepts_new_uppercase_model_footer(self):
+        output = '› Ask Codex to do anything\n  GPT-6-Sol medium · ~/projects'
+        self.assertEqual(runtime.terminal_model(output, runtime.AgentKind.CODEX), 'gpt-6-sol')
+        self.assertEqual(runtime.terminal_effort(output, runtime.AgentKind.CODEX), 'medium')
+        self.assertTrue(runtime.terminal_ready(output, runtime.AgentKind.CODEX))
+
     def test_claude_startup_model(self):
         output = '▐▛███▜▌   Claude Code v2.1.260\n▝▜█████▛▘  Fable 5 · Claude Max\n❯ '
         self.assertEqual(runtime.terminal_model(output, runtime.AgentKind.CLAUDE), 'Fable 5')
@@ -28,6 +34,15 @@ class TerminalStateTests(unittest.TestCase):
     def test_idle_composer_is_ready(self):
         self.assertTrue(runtime.terminal_ready('› Ask Codex to do anything\n  gpt-6-astra medium · /tmp', runtime.AgentKind.CODEX))
 
+    def test_codex_alternate_composer_is_ready_but_menu_is_not(self):
+        self.assertTrue(runtime.terminal_ready('» Ask Codex to do anything\n  GPT-6-Sol ultra · /tmp', runtime.AgentKind.CODEX))
+        self.assertFalse(runtime.terminal_ready('Select Model and Effort\n» 1. gpt-6-sol (current)\n  GPT-6-Sol ultra · /tmp', runtime.AgentKind.CODEX))
+
+    def test_working_codex_accepts_messages_but_not_commands(self):
+        output = '• Working (5m 46s • esc to interrupt)\n\n› Ask Codex to do anything\n  GPT-6-Sol medium · /tmp'
+        self.assertFalse(runtime.terminal_ready(output, runtime.AgentKind.CODEX))
+        self.assertTrue(runtime.terminal_ready(output, runtime.AgentKind.CODEX, allow_working=True))
+
 
 class ModelRecoveryTests(unittest.TestCase):
     @patch.object(watcher, 'pane_exists', return_value=True)
@@ -35,6 +50,12 @@ class ModelRecoveryTests(unittest.TestCase):
     @patch.object(watcher, '_type_command', return_value=False)
     def test_reuses_already_open_model_picker(self, _type, _capture, _exists):
         self.assertIn('gpt-6-astra', watcher._open_codex_model_picker('%1'))
+
+    @patch.object(watcher, '_close_codex_picker')
+    @patch.object(watcher, '_open_codex_model_picker', return_value='Select Model and Effort\n› 1. unknown-model')
+    def test_unreadable_picker_is_closed(self, _open, close):
+        self.assertIsNone(watcher._probe_codex_models('%1'))
+        close.assert_called_once_with('%1')
 
 
 if __name__ == '__main__':
@@ -63,6 +84,18 @@ class StartupFlowTests(unittest.TestCase):
         self.assertEqual(watcher.tg_sessions.pending_messages('%1')[0]['text'], 'hello')
         send.assert_not_called()
 
+    @patch.object(watcher, 'pane_exists', return_value=True)
+    @patch.object(watcher, '_capture_pane', return_value='• Working (2m • esc to interrupt)\n› Ask Codex to do anything\n  GPT-6-Sol medium · /tmp')
+    def test_working_codex_routes_new_message_immediately(self, *_):
+        self.assertTrue(watcher.queue_if_blocked('%1', 'follow-up', 9, 42))
+        self.assertEqual(watcher.tg_sessions.pending_messages('%1'), [])
+
+    @patch.object(watcher, 'tg_send')
+    @patch.object(watcher, '_capture_pane', return_value='» Ask Codex to do anything\n  GPT-6-Sol ultra · /tmp')
+    def test_alternate_codex_composer_does_not_queue_message(self, *_):
+        self.assertTrue(watcher.queue_if_blocked('%1', 'follow-up', 9, 42))
+        self.assertEqual(watcher.tg_sessions.pending_messages('%1'), [])
+
     @patch.object(watcher, 'tg_react')
     @patch.object(watcher, 'mark_pane_waiting')
     @patch.object(watcher, 'tg_send', return_value={'ok': True})
@@ -75,6 +108,17 @@ class StartupFlowTests(unittest.TestCase):
         watcher.check_starting_sessions()
         send.assert_called_once_with('%1', 'one')
         self.assertEqual(watcher.tg_sessions.pending_messages('%1'), [{'text': 'two', 'message_id': 8}])
+
+    @patch.object(watcher, 'tg_react')
+    @patch.object(watcher, 'mark_pane_waiting')
+    @patch.object(watcher, 'pane_exists', return_value=True)
+    @patch.object(watcher, '_capture_pane', return_value='• Working (2m • esc to interrupt)\n› Ask Codex to do anything\n  GPT-6-Sol medium · /tmp')
+    @patch.object(watcher, 'tmux_send_codex', return_value=True)
+    def test_working_codex_drains_pending_message(self, send, *_):
+        watcher.tg_sessions.queue_message('%1', 'follow-up', 9)
+        watcher.check_starting_sessions()
+        send.assert_called_once_with('%1', 'follow-up')
+        self.assertEqual(watcher.tg_sessions.pending_messages('%1'), [])
 
     @patch.object(watcher, 'tg_edit', return_value={'ok': True})
     @patch.object(watcher, 'pane_exists', return_value=True)

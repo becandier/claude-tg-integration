@@ -161,6 +161,39 @@ def get_session_id(pane_id):
     return data.get("pane_to_session_id", {}).get(pane_id, "")
 
 
+def start_codex_progress(pane_id, session_id, turn_id, offset):
+    """Track only Telegram-initiated Codex turns and survive watcher restarts."""
+    def _do(data):
+        if data.get("pane_to_agent", {}).get(pane_id) != "codex":
+            return
+        current = data.setdefault("pane_to_codex_progress", {}).get(pane_id, {})
+        if current.get("session_id") == session_id and current.get("active"):
+            offset_to_use = min(current["offset"], offset)
+            turn_to_use = turn_id or current.get("turn_id", "")
+        else:
+            offset_to_use = offset
+            turn_to_use = turn_id
+        data["pane_to_codex_progress"][pane_id] = {
+            "session_id": session_id,
+            "turn_id": turn_to_use,
+            "offset": offset_to_use,
+            "active": True,
+        }
+        data.setdefault("pane_to_session_id", {})[pane_id] = session_id
+    _with_lock(_do)
+
+
+def update_codex_progress(pane_id, session_id, turn_id, offset, *, active=None):
+    def _do(data):
+        current = data.get("pane_to_codex_progress", {}).get(pane_id)
+        if not current or current.get("session_id") != session_id or current.get("turn_id") != turn_id:
+            return
+        current["offset"] = offset
+        if active is not None:
+            current["active"] = active
+    _with_lock(_do)
+
+
 def save_agent(pane_id, agent):
     def _do(data):
         data.setdefault("pane_to_agent", {})[pane_id] = agent
@@ -229,6 +262,7 @@ def cleanup_pane(pane_id):
         data.get("pane_to_model", {}).pop(pane_id, None)
         data.get("pane_to_agent", {}).pop(pane_id, None)
         data.get("pane_to_session_id", {}).pop(pane_id, None)
+        data.get("pane_to_codex_progress", {}).pop(pane_id, None)
         data.get("pane_to_startup", {}).pop(pane_id, None)
         data.get("pane_to_pending", {}).pop(pane_id, None)
         data.get("pane_to_title", {}).pop(pane_id, None)
