@@ -9,6 +9,7 @@ Telegram Reply Watcher for Claude Code and Codex CLI (multi-session)
   python3 -u ~/.claude/tg-integration/tg_reply_watcher.py
 """
 
+import glob
 import json
 import hashlib
 import logging
@@ -88,6 +89,7 @@ MEDIA_KINDS = (
 # Импортируем shared-модуль
 sys.path.insert(0, os.path.expanduser("~/.claude/tg-integration"))
 import tg_sessions
+import tg_resume
 import tg_stats
 from tg_codex_submit_hook import PROMPT_MARKER, REACTION_READING, message_id_from_prompt
 from tg_topic_title import format_topic_name
@@ -105,6 +107,7 @@ from agent_runtime import (
     picker_navigation_keys,
     project_callback_data,
     resolve_project_dir,
+    resume_cli_settings,
     terminal_model,
     terminal_effort,
     terminal_ready,
@@ -466,6 +469,20 @@ end tell'''
         logger.error(f"[Terminal] {e}")
 
 
+def live_tmux_panes():
+    """{pane_id: имя tmux-сессии} всех живых pane'ов; {} без tmux-сервера."""
+    result = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{session_name}"],
+        capture_output=True, text=True,
+    )
+    panes = {}
+    for line in result.stdout.splitlines():
+        pane_id, _, session_name = line.partition(" ")
+        if pane_id:
+            panes[pane_id] = session_name
+    return panes
+
+
 def pane_exists(pane_id):
     result = subprocess.run(
         ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
@@ -716,13 +733,54 @@ def cleanup_pid(*_):
 
 # ── Команды бота ──────────────────────────────────────────────
 
-def make_launch_spec(agent, session_name, project_dir):
+def make_launch_spec(agent, session_name, project_dir, *, resume_session_id="", model="", effort=""):
     """Создаёт launch spec; Telegram-доставка Codex идёт через native Stop hook."""
     return LaunchSpec(
         agent=agent,
         session_name=session_name,
         project_dir=project_dir,
+        model=model,
+        effort=effort,
+        resume_session_id=resume_session_id,
     )
+
+
+def _spec_from_startup(agent, state):
+    """Launch spec из pane_to_startup: перезапуск после обновления сохраняет resume."""
+    return make_launch_spec(
+        agent, state["session"], state["project"],
+        resume_session_id=state.get("resume_session_id", ""),
+        model=state.get("launch_model", ""),
+        effort=state.get("launch_effort", ""),
+    )
+
+
+def spawn_agent_session(launch_spec, topic_id):
+    """Запускает CLI в новой tmux-сессии и привязывает pane к топику.
+
+    Возвращает (pane_id, None) или (None, текст ошибки). Общий путь для
+    /newstart и восстановления сессии после перезагрузки.
+    """
+    result = subprocess.run(
+        build_launch_argv(launch_spec),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None, f"❌ Не удалось создать сессию:\n{result.stderr[:200]}"
+
+    result = subprocess.run(
+        ["tmux", "list-panes", "-t", launch_spec.session_name, "-F", "#{pane_id}"],
+        capture_output=True, text=True,
+    )
+    pane_id = result.stdout.strip().split("\n")[0] if result.stdout.strip() else None
+    if not pane_id:
+        subprocess.run(["tmux", "kill-session", "-t", launch_spec.session_name], capture_output=True)
+        return None, "❌ Сессия создана, но не удалось получить pane_id"
+
+    tg_sessions.save_topic(pane_id, topic_id)
+    tg_sessions.save_agent(pane_id, launch_spec.agent.value)
+    tg_sessions.save_project(pane_id, launch_spec.project_dir)
+    return pane_id, None
 
 
 def handle_newstart(msg, text):
@@ -770,36 +828,13 @@ def handle_newstart(msg, text):
         tg_send("❌ Не удалось создать топик", topic_id=src_topic, reply_to=user_msg_id)
         return
 
-    launch_spec = make_launch_spec(agent, session_name, project_dir)
-    result = subprocess.run(
-        build_launch_argv(launch_spec),
-        capture_output=True, text=True,
+    pane_id, error = spawn_agent_session(
+        make_launch_spec(agent, session_name, project_dir), topic_id,
     )
-
-    if result.returncode != 0:
-        tg_send(
-            f"❌ Не удалось создать сессию:\n{result.stderr[:200]}",
-            topic_id=topic_id, reply_to=user_msg_id,
-        )
-        close_topic(topic_id)
-        return
-
-    result = subprocess.run(
-        ["tmux", "list-panes", "-t", session_name, "-F", "#{pane_id}"],
-        capture_output=True, text=True,
-    )
-    pane_id = result.stdout.strip().split("\n")[0] if result.stdout.strip() else None
-
     if not pane_id:
-        tg_send("❌ Сессия создана, но не удалось получить pane_id", topic_id=topic_id)
-        subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+        tg_send(error, topic_id=topic_id, reply_to=user_msg_id)
         close_topic(topic_id)
         return
-
-    # Сохраняем маппинг pane → topic
-    tg_sessions.save_topic(pane_id, topic_id)
-    tg_sessions.save_agent(pane_id, agent.value)
-    tg_sessions.save_project(pane_id, project_dir)
 
     response = tg_send(
         f"⏳ {agent_name} запускается\nПроект: {project_name}\nСессия: {session_name}\nМодель: определяется после запуска",
@@ -821,6 +856,130 @@ def handle_newstart(msg, text):
         f"[NewStart] agent={agent.value} session={session_name} pane={pane_id} "
         f"topic={topic_id} project={project_name}"
     )
+
+
+RESUME_FAILURES = {
+    tg_resume.NO_SESSION_ID: (
+        "⚠️ Сессия этого топика завершилась, но её id не сохранился — "
+        "восстановить историю нельзя. Начни новую: /newclaude или /newcodex"
+    ),
+    tg_resume.NO_PROJECT: "⚠️ Не могу восстановить сессию: каталог проекта не найден ({project})",
+    tg_resume.NO_HISTORY: (
+        "⚠️ Не могу восстановить сессию: история {session_id} не найдена на диске. "
+        "Начни новую: /newclaude или /newcodex"
+    ),
+}
+
+
+def _resume_history_exists(record):
+    """Журнал сессии на диске: без него `--resume` / `codex resume` завершится ошибкой."""
+    session_id = record["session_id"]
+    if record.get("agent") == AgentKind.CODEX.value:
+        return bool(tg_stats.find_codex_rollout(session_id))
+    path = tg_stats.claude_transcript_path({"sessionId": session_id, "cwd": record["project"]})
+    if path and os.path.isfile(path):
+        return True
+    # cwd мог быть записан Claude в другом написании (симлинк, realpath).
+    return bool(glob.glob(os.path.join(tg_stats.CLAUDE_PROJECTS_DIR, "*", f"{session_id}.jsonl")))
+
+
+def _drop_stale_panes(topic_id):
+    """Убирает мёртвые pane'ы топика; возвращает их неотправленную очередь."""
+    data = tg_sessions._load()
+    pending = []
+    for pane_id, tid in list(data.get("pane_to_topic", {}).items()):
+        if tid != int(topic_id) or pane_exists(pane_id):
+            continue
+        pending += data.get("pane_to_pending", {}).get(pane_id, [])
+        cleanup_media(pane_id)
+        clear_pane_waiting(pane_id)
+        tg_sessions.cleanup_pane(pane_id)
+        logger.info(f"[Resume] dropped stale pane {pane_id} of topic {topic_id}")
+    return pending
+
+
+def restore_topic_session(topic_id, user_msg_id):
+    """Поднимает сессию топика по постоянному снимку (после перезагрузки Mac).
+
+    Возвращает pane_id; "" — восстановить нельзя, пользователь уведомлён;
+    None — снимка нет, вызывающий оставляет прежнее поведение.
+    Повторный вызов при живом pane возвращает его же: несколько сообщений
+    подряд не запускают вторую сессию, а встают в очередь первой.
+    """
+    pane_id = tg_sessions.get_pane_by_topic(topic_id)
+    if pane_id and pane_exists(pane_id):
+        return pane_id
+
+    record = tg_resume.get(topic_id)
+    decision = tg_resume.resume_decision(record, history_exists=_resume_history_exists)
+    if decision == tg_resume.NO_SNAPSHOT:
+        return None
+    if decision != tg_resume.RESTORE:
+        logger.info(f"[Resume] topic {topic_id}: {decision}")
+        tg_send(RESUME_FAILURES[decision].format(**record), topic_id=topic_id, reply_to=user_msg_id)
+        return ""
+
+    try:
+        agent = AgentKind(record.get("agent", AgentKind.CLAUDE.value))
+    except ValueError:
+        tg_send("⚠️ Не могу восстановить сессию: неизвестный тип агента", topic_id=topic_id)
+        return ""
+    if shutil.which(agent.value) is None:
+        tg_send(f"❌ CLI не найден: {agent.value}", topic_id=topic_id, reply_to=user_msg_id)
+        return ""
+
+    pending = _drop_stale_panes(topic_id)
+    model, effort, late_effort = resume_cli_settings(
+        agent, record.get("model", ""), record.get("effort", ""),
+    )
+    session_name = make_session_name(agent, time.time_ns())
+    try:
+        pane_id, error = spawn_agent_session(make_launch_spec(
+            agent, session_name, record["project"],
+            resume_session_id=record["session_id"], model=model, effort=effort,
+        ), topic_id)
+    except ValueError as e:
+        pane_id, error = None, f"⚠️ Не могу восстановить сессию: {e}"
+    if not pane_id:
+        tg_send(error, topic_id=topic_id, reply_to=user_msg_id)
+        return ""
+
+    if record.get("model"):
+        tg_sessions.save_model(pane_id, record["model"])
+    if record.get("effort"):
+        tg_sessions.save_effort(pane_id, record["effort"])
+    tg_sessions.save_session_id(pane_id, record["session_id"])
+    if record.get("title"):
+        def _title(data):
+            data.setdefault("pane_to_title", {})[pane_id] = record["title"]
+        tg_sessions._with_lock(_title)
+    if record.get("topic_name"):
+        tg_sessions.save_topic_name(pane_id, record["topic_name"])
+    for item in pending:
+        tg_sessions.queue_message(pane_id, item["text"], item["message_id"])
+
+    project_name = os.path.basename(record["project"].rstrip("/"))
+    response = tg_send(
+        f"♻️ Восстанавливаю сессию…\nПроект: {project_name}\nСессия: {session_name}"
+        "\nСообщение отправлю, когда CLI будет готов.",
+        topic_id=topic_id,
+    )
+    tg_sessions.save_startup(pane_id, {
+        "session": session_name, "project": record["project"],
+        "started_at": time.time(),
+        "message_id": response.get("result", {}).get("message_id"),
+        "resume_session_id": record["session_id"],
+        "launch_model": model, "launch_effort": effort, "late_effort": late_effort,
+    })
+    if response.get("ok"):
+        tg_sessions.save_route(str(response["result"]["message_id"]), pane_id)
+    tg_sessions.save_reply_to(pane_id, user_msg_id)
+    open_terminal_with_tmux(session_name)
+    logger.info(
+        f"[Resume] agent={agent.value} session={session_name} pane={pane_id} "
+        f"topic={topic_id} resume={record['session_id']}"
+    )
+    return pane_id
 
 
 def _is_project(path):
@@ -1070,7 +1229,8 @@ def close_session(session_name):
 
 
 def close_topic(topic_id):
-    """Удаляет Forum Topic."""
+    """Удаляет Forum Topic и снимок восстановления: закрытую сессию не поднимаем."""
+    tg_resume.forget(topic_id)
     resp = tg_api("deleteForumTopic", {
         "chat_id": CHAT_ID,
         "message_thread_id": topic_id,
@@ -1102,6 +1262,7 @@ def handle_close(msg):
 
     # Если /close из топика — закрыть сессию этого топика
     if topic_id:
+        tg_resume.forget(topic_id)
         pane_id = tg_sessions.get_pane_by_topic(topic_id)
         if pane_id:
             tg_send("🔴 Закрываю сессию...", topic_id=topic_id)
@@ -1307,6 +1468,14 @@ def _capture_pane(pane_id):
 
 
 _startup_notices = {}
+_resume_screens = {}
+
+
+def _resume_screen_settled(pane_id, output):
+    """True, если экран не изменился с прошлого опроса."""
+    previous = _resume_screens.get(pane_id)
+    _resume_screens[pane_id] = output
+    return previous == output
 
 
 def sync_topic_titles():
@@ -1393,7 +1562,7 @@ def check_starting_sessions():
             if result.stdout.strip().startswith("1 ") and not state.get("restart_failed"):
                 if result.stdout.strip() != "1 0":
                     tg_send("⚠️ Обновление завершилось с ошибкой. Запускаю установленную версию Codex; сообщения сохранены.", topic_id=topic_id)
-                argv = build_launch_argv(make_launch_spec(agent, state["session"], state["project"]))[7:]
+                argv = build_launch_argv(_spec_from_startup(agent, state))[7:]
                 restarted = subprocess.run(
                     ["tmux", "respawn-pane", "-t", pane_id, "-c", state["project"], *argv],
                     capture_output=True, text=True,
@@ -1428,6 +1597,10 @@ def check_starting_sessions():
                 continue
         if terminal_ready(output, agent, allow_working=(agent is AgentKind.CODEX and not state)):
             _startup_notices.pop(pane_id, None)
+            if state and state.get("resume_session_id") and not _resume_screen_settled(pane_id, output):
+                # Восстановленная сессия перерисовывает историю, и старые строки
+                # `❯ …` похожи на строку ввода: ждём два одинаковых снимка подряд.
+                continue
             if state:
                 model = terminal_model(output, agent)
                 if not model and agent is AgentKind.CLAUDE:
@@ -1439,14 +1612,27 @@ def check_starting_sessions():
                 if effort:
                     tg_sessions.save_effort(pane_id, effort)
                 label = "Codex" if agent is AgentKind.CODEX else "Claude Code"
-                text = (f"🚀 {label} готов\nПроект: {os.path.basename(state['project'])}"
+                if state.get("resume_session_id"):
+                    label = f"♻️ {label} восстановлен и"
+                else:
+                    label = f"🚀 {label}"
+                text = (f"{label} готов\nПроект: {os.path.basename(state['project'])}"
                         f"\nСессия: {state['session']}\nМодель: {model or 'не удалось определить'}"
                         f"\nEffort: {effort or 'не удалось определить'}")
                 response = (tg_edit(state["message_id"], text) if state.get("message_id")
                             else tg_send(text, topic_id=topic_id))
                 tg_sessions.save_startup(pane_id, None)
+                _resume_screens.pop(pane_id, None)
                 if not response.get("ok"):
                     tg_send(text, topic_id=topic_id)
+                late_effort = state.get("late_effort")
+                if late_effort:
+                    # Этот effort флагом запуска не задаётся — применяем командой.
+                    if set_session_effort(pane_id, late_effort, agent):
+                        tg_sessions.save_effort(pane_id, late_effort)
+                    else:
+                        tg_send(f"⚠️ Не удалось вернуть effort {late_effort}; проверь /effort", topic_id=topic_id)
+                    continue  # очередь — на следующем опросе, после команды /effort
             messages = tg_sessions.pending_messages(pane_id)
             if messages:
                 item = messages[0]
@@ -2116,10 +2302,23 @@ def check_dead_panes():
     _last_pane_check = now
 
     data = tg_sessions._load()
+    live = live_tmux_panes()
+    try:
+        tg_resume.refresh(data, live)
+    except OSError as e:
+        logger.error(f"[Resume] snapshot refresh failed: {e}")
     pane_to_topic = data.get("pane_to_topic", {})
     for pane_id, topic_id in list(pane_to_topic.items()):
         if not pane_exists(pane_id):
-            tg_send("⚠️ Сессия завершилась", topic_id=topic_id)
+            # Снимок восстановления не трогаем: по нему следующее сообщение
+            # в топике поднимет сессию с той же историей.
+            restorable = tg_resume.resume_decision(tg_resume.get(topic_id)) == tg_resume.RESTORE
+            tg_send(
+                "⚠️ Сессия завершилась" + (
+                    ". Напиши сообщение — подниму её с той же историей." if restorable else ""
+                ),
+                topic_id=topic_id,
+            )
             cleanup_media(pane_id)
             clear_pane_waiting(pane_id)
             tg_sessions.cleanup_pane(pane_id)
@@ -2671,6 +2870,19 @@ def main():
 
             if topic_id:
                 pane_id = tg_sessions.get_pane_by_topic(topic_id)
+                if not (pane_id and pane_exists(pane_id)):
+                    # Нет живого pane (перезагрузка, падение tmux): поднимаем
+                    # сессию по снимку, сообщение встанет в очередь запуска.
+                    try:
+                        restored = restore_topic_session(topic_id, user_msg_id)
+                    except Exception:
+                        logger.exception(f"[Resume] topic {topic_id} failed")
+                        tg_send("⚠️ Не удалось восстановить сессию, подробности в логе watcher", topic_id=topic_id)
+                        continue
+                    if restored == "":
+                        continue
+                    if restored:
+                        pane_id = restored
 
             if not pane_id:
                 reply_to = msg.get("reply_to_message")
@@ -2754,7 +2966,13 @@ def main():
                     tg_sessions.queue_message(pane_id, text, user_msg_id)
                     tg_send("⏳ Не удалось передать сообщение. Оно сохранено для повторной отправки.", topic_id=topic_id)
                 else:
-                    tg_send("⚠️ Сессия завершилась. Сообщение не отправлено — создай новый чат и повтори его.", topic_id=topic_id)
+                    restorable = topic_id and tg_resume.resume_decision(tg_resume.get(topic_id)) == tg_resume.RESTORE
+                    tg_send(
+                        "⚠️ Сессия завершилась. Сообщение не отправлено — "
+                        + ("повтори его, и я подниму сессию с той же историей." if restorable
+                           else "создай новый чат и повтори его."),
+                        topic_id=topic_id,
+                    )
                     cleanup_media(pane_id)
                     tg_sessions.cleanup_pane(pane_id)
 

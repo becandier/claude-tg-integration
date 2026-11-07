@@ -21,6 +21,8 @@ class LaunchSpec:
     model: str = ""
     effort: str = ""
     notify_command: tuple[str, ...] = ()
+    # Id сессии CLI для продолжения истории (восстановление после перезагрузки).
+    resume_session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,9 @@ class PickerOption:
 _SAFE_SESSION_RE = re.compile(r"^(?:claude|codex)-[a-zA-Z0-9_-]+$")
 _SAFE_MODEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$")
 _CODEX_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+# Значения флага `claude --effort` (claude --help); ultracode флагом не задаётся.
+_CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_RESUME_ID_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,63}$")
 
 
 def parse_newstart_args(text: str) -> tuple[AgentKind, str | None]:
@@ -290,18 +295,29 @@ def build_launch_argv(spec: LaunchSpec) -> list[str]:
         raise ValueError("project directory is required")
     if spec.model and not _SAFE_MODEL_RE.fullmatch(spec.model):
         raise ValueError("invalid model")
-    if spec.effort and spec.effort not in _CODEX_EFFORTS:
+    efforts = _CLAUDE_EFFORTS if spec.agent is AgentKind.CLAUDE else _CODEX_EFFORTS
+    if spec.effort and spec.effort not in efforts:
         raise ValueError("invalid effort")
+    if spec.resume_session_id and not _RESUME_ID_RE.fullmatch(spec.resume_session_id):
+        raise ValueError("invalid resume session id")
 
     argv = [
         "tmux", "new-session", "-d", "-s", spec.session_name,
         "-c", spec.project_dir,
     ]
     if spec.agent is AgentKind.CLAUDE:
-        return argv + ["claude", "--dangerously-skip-permissions"]
+        claude_argv = ["claude", "--dangerously-skip-permissions"]
+        if spec.resume_session_id:
+            claude_argv += ["--resume", spec.resume_session_id]
+        if spec.model:
+            claude_argv += ["--model", spec.model]
+        if spec.effort:
+            claude_argv += ["--effort", spec.effort]
+        return argv + claude_argv
 
-    codex_argv = [
-        "codex", "--dangerously-bypass-approvals-and-sandbox",
+    # `codex resume [OPTIONS] [SESSION_ID]`: флаги после подкоманды, id последним.
+    codex_argv = ["codex"] + (["resume"] if spec.resume_session_id else []) + [
+        "--dangerously-bypass-approvals-and-sandbox",
         "--dangerously-bypass-hook-trust",
         "--no-alt-screen",
     ]
@@ -318,4 +334,25 @@ def build_launch_argv(spec: LaunchSpec) -> list[str]:
             separators=(",", ":"),
         )
         codex_argv += ["-c", f"notify={notify_toml}"]
+    if spec.resume_session_id:
+        codex_argv.append(spec.resume_session_id)
     return argv + codex_argv
+
+
+def resume_cli_settings(agent: AgentKind, model: str, effort: str) -> tuple[str, str, str]:
+    """Сохранённые модель/effort → (model, effort, late_effort): первые два идут
+    флагами запуска, late_effort флагом не задаётся и применяется командой
+    после готовности CLI (Claude `ultracode`, Codex `max`/`ultra`).
+
+    Claude хранит то алиас (`opus`), то подпись (`Fable 5.1`, `Opus 5 (1M context)`):
+    подпись сводится к алиасу семейства, версия и размер окна при этом теряются.
+    """
+    model = (model or "").strip()
+    if model and not _SAFE_MODEL_RE.fullmatch(model):
+        family = model.split()[0].lower() if agent is AgentKind.CLAUDE else ""
+        model = family if family.isalpha() else ""
+    efforts = _CLAUDE_EFFORTS if agent is AgentKind.CLAUDE else _CODEX_EFFORTS
+    effort = (effort or "").strip().lower()
+    if effort in efforts:
+        return model, effort, ""
+    return model, "", effort

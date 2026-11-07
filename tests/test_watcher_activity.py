@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -6,6 +8,13 @@ import tg_reply_watcher as watcher
 
 class ActivityMonitoringTests(unittest.TestCase):
     def setUp(self):
+        # Любая запись в хранилище из этих тестов не должна попасть в боевой /tmp.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for target, name in ((watcher.tg_sessions, "SESSIONS_FILE"), (watcher.tg_resume, "RESUME_FILE")):
+            patcher = patch.object(target, name, os.path.join(tmp.name, name.lower()))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.original_activity = watcher._pane_activity
         self.original_last_check = watcher._last_pane_check
         watcher._pane_activity = {
@@ -23,6 +32,8 @@ class ActivityMonitoringTests(unittest.TestCase):
         watcher._pane_activity = self.original_activity
         watcher._last_pane_check = self.original_last_check
 
+    @patch.object(watcher.tg_resume, "refresh")
+    @patch.object(watcher, "live_tmux_panes", return_value={"%1": "claude-1"})
     @patch.object(watcher.os.path, "exists", return_value=False)
     @patch.object(watcher, "_capture_pane_content", return_value="new")
     @patch.object(watcher, "pane_exists", return_value=True)
@@ -37,6 +48,8 @@ class ActivityMonitoringTests(unittest.TestCase):
         _pane_exists,
         _capture,
         _path_exists,
+        _live,
+        _refresh,
     ):
         watcher.check_dead_panes()
 
