@@ -204,3 +204,42 @@ class StartupRecoveryTests(StartupFlowTests):
         watcher.check_starting_sessions()
         self.assertNotIn('updating', watcher.tg_sessions._load()['pane_to_startup']['%1'])
         self.assertEqual(watcher.tg_sessions.pending_messages('%1')[0]['text'], 'hello')
+
+
+class TerminalAttachTests(unittest.TestCase):
+    def _run(self, attached_answers, osascript_rc=0):
+        answers = iter(attached_answers)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv[0])
+            if argv[0] == "osascript":
+                return runtime_completed(osascript_rc, "", "boom" if osascript_rc else "")
+            return runtime_completed(0, next(answers, "0") + "\n", "")
+
+        with patch.object(watcher.subprocess, "run", side_effect=fake_run), \
+                patch.object(watcher.time, "sleep"):
+            ok = watcher._attach_terminal("claude-1", "script", attempts=2, wait=0.05, poll=0)
+        return ok, calls
+
+    def test_success_is_confirmed_by_tmux_not_by_osascript(self):
+        ok, calls = self._run(["0", "1"])
+        self.assertTrue(ok)
+        self.assertEqual(calls.count("osascript"), 1)
+
+    def test_retries_when_terminal_did_not_attach(self):
+        # Первая попытка: iTerm2 ещё запускается, клиент так и не подключился.
+        answers = ["0"] * 10_000
+        ok, calls = self._run(answers)
+        self.assertFalse(ok)
+        self.assertEqual(calls.count("osascript"), 2)
+
+    def test_osascript_error_still_waits_and_retries(self):
+        ok, calls = self._run(["0"] * 10_000, osascript_rc=1)
+        self.assertFalse(ok)
+        self.assertEqual(calls.count("osascript"), 2)
+
+
+def runtime_completed(rc, stdout, stderr):
+    import subprocess
+    return subprocess.CompletedProcess([], rc, stdout, stderr)

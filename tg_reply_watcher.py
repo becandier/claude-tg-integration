@@ -461,12 +461,58 @@ tell application "Terminal"
     do script "{cmd}"
 end tell'''
 
-    try:
-        subprocess.Popen(["osascript", "-e", script],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        logger.info(f"[Terminal] opened {TERMINAL_APP}/{TERMINAL_MODE} for {session_name}")
-    except Exception as e:
-        logger.error(f"[Terminal] {e}")
+    threading.Thread(
+        target=_attach_terminal, args=(session_name, script), daemon=True,
+    ).start()
+
+
+TERMINAL_ATTACH_ATTEMPTS = 3
+TERMINAL_ATTACH_WAIT = 10.0
+
+
+def _tmux_session_attached(session_name):
+    """True, если к tmux-сессии подключён хотя бы один клиент."""
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", session_name, "#{session_attached}"],
+        capture_output=True, text=True,
+    )
+    count = result.stdout.strip()
+    return result.returncode == 0 and count.isdigit() and int(count) > 0
+
+
+def _attach_terminal(session_name, script, attempts=TERMINAL_ATTACH_ATTEMPTS,
+                     wait=TERMINAL_ATTACH_WAIT, poll=0.5):
+    """Запускает AppleScript и проверяет по tmux, что терминал подключился.
+
+    Сразу после входа в систему iTerm2 ещё запускается: osascript отрабатывает
+    без ошибки, а вкладка не появляется. Успех подтверждает только
+    session_attached; иначе скрипт повторяется. Возвращает True при успехе.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    f"[Terminal] osascript rc={result.returncode} for {session_name}: "
+                    f"{result.stderr.strip()[:300]}"
+                )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"[Terminal] osascript failed for {session_name}: {e}")
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if _tmux_session_attached(session_name):
+                logger.info(
+                    f"[Terminal] attached {TERMINAL_APP}/{TERMINAL_MODE} to {session_name} "
+                    f"(attempt {attempt})"
+                )
+                return True
+            time.sleep(poll)
+        logger.warning(f"[Terminal] {session_name} not attached after attempt {attempt}")
+    logger.error(f"[Terminal] gave up attaching {session_name}; run: tmux attach -t {session_name}")
+    return False
 
 
 def live_tmux_panes():
